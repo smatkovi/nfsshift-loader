@@ -11,9 +11,21 @@
 # Spieldaten von Electronic Arts sind NICHT enthalten; sie werden mit
 # harbour-nfsshift-import-data aus der Kopie des Nutzers importiert.
 
-# --with gamedata: baut zusaetzlich das (nicht weitergebbare) Datenpaket aus
-# einem gamedata/-Verzeichnis im Quelltarball.
+# --with gamedata: legt die Spieldaten aus einem gamedata/-Verzeichnis im
+# Quelltarball mit ins Paket, statt sie beim ersten Start zu importieren.  Das
+# Ergebnis enthaelt dann fremdes Material (Electronic Arts) und darf nicht
+# weitergegeben werden -- es ist fuer die eigenen Geraete gedacht.
 %bcond_with gamedata
+
+%if %{with gamedata}
+# Mit den Spieldaten ist das ein anderes Paket als das freie mit derselben
+# Version.  Das Release bekommt deshalb "full" angehaengt: 0.1.2-1full ist
+# neuer als 0.1.2-1, das volle Paket ersetzt ein installiertes freies also
+# beim Aktualisieren, und beide sind nie zu verwechseln.
+%global relsuffix full
+%global datalicense and Proprietary
+%global datasummary samt Spieldaten
+%endif
 
 # --with prebuilt: uebernimmt eine fertig gebaute ausfuehrbare Datei aus
 # prebuilt/harbour-nfsshift im Quelltarball, statt sie neu zu uebersetzen.
@@ -25,10 +37,10 @@
 %global debug_package %{nil}
 
 Name:       harbour-nfsshift
-Version:    0.1.1
-Release:    1
-Summary:    Need for Speed Shift (Marmalade-Build) auf Sailfish OS
-License:    GPL-3.0-or-later
+Version:    0.1.2
+Release:    1%{?relsuffix}
+Summary:    Need for Speed Shift (Marmalade-Build) auf Sailfish OS %{?datasummary}
+License:    GPL-3.0-or-later %{?datalicense}
 URL:        https://example.invalid/nfsshift-sfos
 Source0:    %{name}-%{version}.tar.gz
 
@@ -51,15 +63,17 @@ BuildRequires:  pkgconfig(Qt5Sensors)
 Requires:       qt5-qtsensors-plugin-sensorfw
 # python3 fuer harbour-nfsshift-import-data
 Requires:       /usr/bin/python3
-%if %{with gamedata}
-Requires:       %{name}-data = %{version}-%{release}
-%endif
 
 %description
 Laedt den 32-Bit-ARM-Code des Marmalade-Builds von Need for Speed Shift in
 einen JIT (dynarmic) und setzt die Marmalade-Laufzeit auf SDL2 und OpenGL ES 2
 neu um.  Enthaelt den LAN-Mehrspielermodus (UDP 45470 Suche, UDP 45471 Spiel).
 
+%if %{with gamedata}
+Dieses Paket bringt die Datendateien des Originalspiels mit (Urheberrecht
+Electronic Arts).  Es ist fuer die eigenen Geraete gedacht und darf nicht
+weitergegeben werden.
+%else
 Die Spieldaten von Electronic Arts gehoeren nicht zu diesem Paket.  Sie werden
 einmalig aus einer vorhandenen Kopie des Originals importiert:
 
@@ -67,18 +81,6 @@ einmalig aus einer vorhandenen Kopie des Originals importiert:
 
 Das Werkzeug sucht ~/Downloads/nfsshift*.deb bzw. ein bereits entpacktes
 Verzeichnis und legt die Daten unter ~/.local/share/harbour-nfsshift/data ab.
-
-%if %{with gamedata}
-%package data
-Summary:    Spieldaten von Need for Speed Shift
-License:    Proprietary
-BuildArch:  noarch
-Requires:   %{name} = %{version}-%{release}
-
-%description data
-Die unveraenderten Datendateien des Originalspiels (NFSShift.s3e, res.dz,
-Musik, Splashscreens).  Urheberrecht Electronic Arts - nicht weitergebbar,
-nur fuer den privaten Gebrauch auf dem eigenen Geraet gebaut.
 %endif
 
 %prep
@@ -130,6 +132,18 @@ install -d %{buildroot}%{_datadir}/%{name}/data
 cp -a gamedata/. %{buildroot}%{_datadir}/%{name}/data/
 %endif
 
+%if %{with gamedata}
+%pre
+# Ein frueher installiertes freies Paket hat unter %{_datadir}/%{name}/data
+# einen Symlink ins Home angelegt (dessen %%post).  rpm kann darueber kein
+# Verzeichnis auspacken ("Not a directory"), also weg damit -- die Daten im
+# Home bleiben davon unberuehrt.
+if [ -L %{_datadir}/%{name}/data ]; then
+    rm -f %{_datadir}/%{name}/data
+fi
+exit 0
+%endif
+
 %if %{without gamedata}
 %post
 # Sailfish OS: der Geraetebesitzer hat uid 100000 ("defaultuser").
@@ -155,13 +169,10 @@ exit 0
 %{_datadir}/applications/%{name}.desktop
 %{_datadir}/icons/hicolor/*/apps/%{name}.png
 %dir %{_datadir}/%{name}
-
 %if %{with gamedata}
-%files data
-%defattr(-,root,root,-)
-%dir %{_datadir}/%{name}/data
-%{_datadir}/%{name}/data/*
+%{_datadir}/%{name}/data
 %endif
+
 
 %changelog
 * Sat Sep 12 2026 smatkovi <sebastian.matkovich@gmail.com> - 0.1.0-1

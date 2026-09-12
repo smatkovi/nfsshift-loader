@@ -8,7 +8,15 @@
 #   packaging/sfos/build-rpm.sh                 # vollstaendiger Bau aus dem Quelltext
 #   packaging/sfos/build-rpm.sh --prebuilt      # fertiges Binary aus dem Container uebernehmen
 #   packaging/sfos/build-rpm.sh --check         # nur .spec und .desktop pruefen
-#   packaging/sfos/build-rpm.sh --gamedata DIR  # zusaetzlich das private Datenpaket
+#   packaging/sfos/build-rpm.sh --gamedata DIR  # Spieldaten von HIER mit einpacken
+#   packaging/sfos/build-rpm.sh --gamedata-host DIR   # ... aus DIR auf dem Build-Rechner
+#
+# Mit --gamedata/--gamedata-host entsteht das private Vollpaket
+# harbour-nfsshift-<ver>-1full: Loader und die rund 100 MB Spieldaten von
+# Electronic Arts in einer Datei, nichts muss mehr importiert werden.  Es ist
+# fuer die eigenen Geraete und darf nicht weitergegeben werden.
+# --gamedata-host spart die 100 MB Uebertragung, wenn die Daten auf dem
+# Build-Rechner ohnehin schon liegen (z. B. /tmp/nfsx86/data).
 #
 # Umgebungsvariablen:
 #   BUILD_HOST     Vorgabe sebastian@192.168.1.21
@@ -34,6 +42,7 @@ OUT="$HERE/build/rpm"
 
 MODE=full
 GAMEDATA=
+GAMEDATA_HOST=
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -41,6 +50,7 @@ while [ $# -gt 0 ]; do
         --check)    MODE=check ;;
         --full)     MODE=full ;;
         --gamedata) GAMEDATA=$2; shift ;;
+        --gamedata-host) GAMEDATA_HOST=$2; shift ;;
         -h|--help)  sed -n '2,22p' "$0"; exit 0 ;;
         *) echo "unbekannte Option: $1" >&2; exit 2 ;;
     esac
@@ -51,14 +61,33 @@ NAME=$(sed -n 's/^Name: *//p' "$SPEC" | head -1)
 VERSION=$(sed -n 's/^Version: *//p' "$SPEC" | head -1)
 RELEASE=$(sed -n 's/^Release: *//p' "$SPEC" | head -1)
 [ -n "$NAME" ] && [ -n "$VERSION" ] || { echo "Name/Version nicht aus $SPEC lesbar" >&2; exit 1; }
+# %{?relsuffix} steht so in der .spec; hier ausschreiben, damit die Zeile den
+# Paketnamen zeigt, der wirklich herauskommt.
+if [ -n "$GAMEDATA" ] || [ -n "$GAMEDATA_HOST" ]; then
+    RELEASE=$(echo "$RELEASE" | sed 's/%{?relsuffix}/full/')
+else
+    RELEASE=$(echo "$RELEASE" | sed 's/%{?relsuffix}//')
+fi
 echo "== $NAME-$VERSION-$RELEASE  ($MODE, $TARGET)"
 
 # --- 1. Quelltext in den Container spiegeln ---------------------------------
-# Der Container sieht das Host-/tmp nicht, deshalb wird der Baum wie in
-# tools/build.sh per Pipe in den Container gepackt.
-echo "== Quelltext -> $CONTAINER:/home/mersdk/nfsloader/$PROJ"
-tar -C "$HERE/.." -cf - --exclude=build --exclude=.git "$PROJ" |
-    ssh "$HOST" "docker exec -i $CONTAINER sh -c 'mkdir -p /home/mersdk/nfsloader && tar -xf - -C /home/mersdk/nfsloader'"
+# Zweistufig: rsync auf den Build-Rechner, von dort mit tar in den Container
+# (der sieht das Host-Dateisystem nicht).  Warum nicht wie frueher eine einzige
+# tar-Pipe vom Telefon in den Container: ueber den cloudflared-Tunnel laeuft
+# das mit rund 1 MB/s, und ein haengender Tunnel liess die Pipe minutenlang
+# stehen.  rsync uebertraegt nur die Aenderungen und ein Abbruch kostet nicht
+# den ganzen Baum; der zweite Schritt ist auf dem Build-Rechner lokal.
+STAGE_HOST=${SRC_STAGE:-/tmp/nfssrc}
+echo "== Quelltext -> $HOST:$STAGE_HOST/$PROJ (rsync)"
+rsync -a --delete --exclude=build --exclude=.git \
+      --rsync-path="mkdir -p '$STAGE_HOST/$PROJ' && rsync" \
+      "$HERE/" "$HOST:$STAGE_HOST/$PROJ/"
+echo "== $STAGE_HOST/$PROJ -> $CONTAINER:/home/mersdk/nfsloader/$PROJ"
+ssh "$HOST" "tar -C '$STAGE_HOST' -cf - '$PROJ' |
+    docker exec -i $CONTAINER sh -c 'mkdir -p /home/mersdk/nfsloader && tar -xf - -C /home/mersdk/nfsloader'"
+
+[ -n "$GAMEDATA" ] && [ -n "$GAMEDATA_HOST" ] &&
+    { echo "--gamedata und --gamedata-host schliessen sich aus" >&2; exit 2; }
 
 if [ -n "$GAMEDATA" ]; then
     [ -f "$GAMEDATA/NFSShift.s3e" ] || { echo "$GAMEDATA enthaelt keine NFSShift.s3e" >&2; exit 1; }
@@ -68,6 +97,18 @@ if [ -n "$GAMEDATA" ]; then
             rm -rf /home/mersdk/nfsloader/gamedata &&
             mkdir -p /home/mersdk/nfsloader/gamedata &&
             tar -xf - -C /home/mersdk/nfsloader/gamedata'"
+fi
+
+if [ -n "$GAMEDATA_HOST" ]; then
+    echo "== Spieldaten $GAMEDATA_HOST (auf $HOST) -> Container"
+    ssh "$HOST" "
+        [ -f '$GAMEDATA_HOST/NFSShift.s3e' ] ||
+            { echo '$GAMEDATA_HOST enthaelt keine NFSShift.s3e' >&2; exit 1; }
+        tar -C '$GAMEDATA_HOST' -cf - . | docker exec -i $CONTAINER sh -c '
+            rm -rf /home/mersdk/nfsloader/gamedata &&
+            mkdir -p /home/mersdk/nfsloader/gamedata &&
+            tar -xf - -C /home/mersdk/nfsloader/gamedata'"
+    GAMEDATA=$GAMEDATA_HOST
 fi
 
 # --- 2. Bauen ---------------------------------------------------------------
@@ -165,12 +206,18 @@ REMOTE
 if [ "$MODE" = check ]; then exit 0; fi
 
 # --- 3. Ergebnis zurueckholen ----------------------------------------------
+# Erst aus dem Container auf den Build-Rechner (lokal), dann von dort per rsync
+# hierher: mit --partial ueberlebt ein Vollpaket von rund 100 MB auch einen
+# Tunnel, der mittendrin abbricht -- der naechste Lauf setzt fort.  Die Kopie
+# unter $STAGE_HOST/out bleibt liegen, von dort geht sie auch ins private Repo.
+[ -t 2 ] && RSYNC_PROGRESS=--info=progress2 || RSYNC_PROGRESS=
 echo "== hole RPMs nach $OUT"
 LIST=$(ssh "$HOST" "docker exec $CONTAINER sh -c 'ls /home/mersdk/rpmbuild-nfsshift/RPMS/*.rpm'")
+ssh "$HOST" "mkdir -p '$STAGE_HOST/out'"
 for r in $LIST; do
     b=$(basename "$r")
-    ssh "$HOST" "docker exec $CONTAINER cat '$r'" > "$OUT/$b.new"
-    mv "$OUT/$b.new" "$OUT/$b"
+    ssh "$HOST" "docker exec $CONTAINER cat '$r' > '$STAGE_HOST/out/$b'"
+    rsync -a --partial $RSYNC_PROGRESS "$HOST:$STAGE_HOST/out/$b" "$OUT/$b"
     echo "   $OUT/$b  ($(wc -c < "$OUT/$b") B)"
 done
 

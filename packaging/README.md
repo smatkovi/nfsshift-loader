@@ -144,18 +144,33 @@ Ohne Paket, direkt aus dem Quellbaum, geht es auch ohne Symlink:
 `harbour-nfsshift --data ~/.local/share/harbour-nfsshift/data` (so macht es
 `tools/run.sh`).
 
-### 1.3 Privates Datenpaket
+### 1.3 Vollpaket mit Spieldaten
 
 Nur fuer den eigenen Gebrauch, nicht weitergebbar:
 
 ```sh
 packaging/sfos/build-rpm.sh --gamedata ~/.local/share/harbour-nfsshift/data
+packaging/sfos/build-rpm.sh --gamedata-host /tmp/nfsx86/data   # Daten liegen schon dort
 ```
 
-Das baut zusaetzlich `harbour-nfsshift-data` (noarch, rund 100 MB, Vorbild
-`supertuxkart-data` auf demselben Geraet) und installiert die Daten nach
-`/usr/share/harbour-nfsshift/data`. Dann entfaellt der Symlink. Achtung: das
-kopiert 100 MB in den Container auf der fast vollen Root-Partition.
+Das legt die rund 100 MB Spieldaten als echtes Verzeichnis
+`/usr/share/harbour-nfsshift/data` mit ins Paket; der Symlink ins Home und
+`harbour-nfsshift-import-data` entfallen damit, das Spiel laeuft direkt nach dem
+Installieren. Das Ergebnis heisst `harbour-nfsshift-<ver>-1full` — dasselbe
+`Name`, aber ein hoeheres `Release` als das freie `-1`, damit es sich weder
+verwechseln laesst noch beim Aktualisieren im Weg steht (`License` nennt
+zusaetzlich `Proprietary`, `Summary` das mitgelieferte Material).
+
+Sein `%pre` loescht einen vorhandenen Symlink
+`/usr/share/harbour-nfsshift/data` — den legt das freie Paket in seinem `%post`
+an, und rpm kann darueber kein Verzeichnis auspacken ("Not a directory"). Die
+Datenkopie im Home bleibt dabei unangetastet.
+
+`--gamedata` schiebt die Daten von hier in den Container, `--gamedata-host`
+nimmt ein Verzeichnis, das auf dem Build-Rechner schon liegt — ueber den
+cloudflared-Tunnel (rund 1 MB/s) ist das der Unterschied zwischen zwei Minuten
+und zwei Stunden. Achtung: der Bau kopiert 100 MB in den Container auf der fast
+vollen Root-Partition und raeumt sie danach wieder weg.
 
 ---
 
@@ -236,6 +251,23 @@ Geprueft mit der Loader-APK der Android-Aufgabe
 (`org.nfsshift.loader` 1.0 (1), 1 680 056 B) und mit der Test-APK aus
 `android-env.md`; beide verifizieren gegen v1, v2 und v3.
 
+Mit `GAMEDATA=<verzeichnis auf dem Build-Rechner>` wandern die Spieldaten als
+`assets/data/` mit in die APK (unkomprimiert, plus eine erzeugte
+`filelist.txt`), und der Loader packt sie beim ersten Start nach
+`/sdcard/Android/data/org.nfsshift.loader/files/nfsshift` aus — dann braucht es
+das `adb push` unten nicht mehr:
+
+```sh
+GAMEDATA=/tmp/nfsx86/data VERSION_NAME=1.0-full VERSION_CODE=2 \
+  APK_NAME=nfsshift-full.apk android/build.sh all
+```
+
+Die APK waechst damit von 1,7 MB auf rund 105 MB, auf dem Geraet kommen die
+ausgepackten 99 MB dazu. Ausgepackt wird ueber `SDL_RWFromFile()` (liest einen
+relativen Pfad direkt aus den Assets) nach `<name>.part` + `rename`; Dateien,
+die schon in der richtigen Groesse daliegen, ueberspringt der Loader. Auch
+diese APK ist fremdes Material und bleibt privat.
+
 Der Keystore liegt auf dem Build-Rechner unter
 `~/.config/nfsshift/nfsshift-release.keystore` — nicht unter `/tmp` (tmpfs, weg
 nach dem Neustart) und nicht im Projekt. Er muss gesichert werden: mit einer
@@ -270,10 +302,14 @@ AF_INET-Sockets gibt es dort auch keine.
   GPL-3.0-or-later und darf weitergegeben werden.
 * **Die Spieldaten** (`res.dz` 70,4 MB, `NFSShift.s3e` 637 KB, 18 lizenzierte
   Musiktitel, Splashscreens; zusammen 99,0 MB) sind unveraendertes Material von
-  Electronic Arts. Sie sind in **keinem** dieser Pakete enthalten und duerfen
-  nicht weitergegeben werden — weder ueber Chum/OpenRepos noch als
-  GitHub-Release noch in einer APK. Der Nutzer bringt seine eigene Kopie mit;
-  `harbour-nfsshift-import-data` holt sie dort ab.
+  Electronic Arts. In den **weitergebbaren** Paketen sind sie nicht enthalten:
+  dort bringt der Nutzer seine eigene Kopie mit, `harbour-nfsshift-import-data`
+  holt sie ab. Nur diese Pakete duerfen ueber Chum/OpenRepos oder ein
+  oeffentliches GitHub-Release gehen.
+* Die Vollpakete aus `--gamedata`/`GAMEDATA` (RPM `-1full`, APK `1.0-full`)
+  enthalten diese Daten und sind ausschliesslich fuer die eigenen Geraete. Sie
+  liegen in den privaten Repos `nfsshift-loader` und `nfsshift-android` und
+  duerfen dort nicht oeffentlich werden.
 * **Das Icon** ist aus dem 80×80-Icon des Originalpakets hochskaliert und damit
   ebenfalls EA-Material. Fuer den privaten Gebrauch auf dem eigenen Geraet ist
   das unproblematisch; **vor einer Veroeffentlichung muss es durch ein eigenes
