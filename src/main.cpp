@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -40,6 +41,22 @@ static std::string find_data_dir(const std::string &home) {
 }
 
 int main(int argc, char **argv) {
+    // Sailfish hangs its volume keys and its silent profile off the PulseAudio
+    // media role: everything the user controls lives under the role "x-maemo",
+    // and a stream with any other role simply is not covered by that policy and
+    // keeps playing at its own volume. SDL labels its stream "game", so the
+    // game stayed loud however far the volume was turned down.
+    //
+    // SDL only learned SDL_HINT_AUDIO_DEVICE_STREAM_ROLE in 2.0.16, which is
+    // newer than the build on the device, so tell libpulse directly. It has to
+    // be the OVERRIDE variant, because plain PULSE_PROP only fills in what the
+    // application has not set itself. Both are read when the client context is
+    // created, so this has to happen before the audio device is opened.
+    if (access("/etc/sailfish-release", F_OK) == 0) {
+        setenv("PULSE_PROP_OVERRIDE", "media.role=x-maemo", 0);
+        setenv("PULSE_PROP", "application.name=NFS Shift", 0);
+    }
+
     std::string data_dir;
     const char *home = getenv("HOME");
     std::string user_dir = std::string(home ? home : "/tmp") + "/.local/share/harbour-nfsshift/save";

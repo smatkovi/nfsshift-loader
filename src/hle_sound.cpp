@@ -504,7 +504,9 @@ void init() {
         logf("[sound] cannot open audio device: %s", SDL_GetError());
         return;
     }
-    logf("[sound] output %d Hz, %d channels, %d frames", have.freq, have.channels, have.samples);
+    const char *drv = SDL_GetCurrentAudioDriver();
+    logf("[sound] %s: output %d Hz, %d channels, %d frames", drv ? drv : "?", have.freq, have.channels,
+         have.samples);
     SDL_PauseAudioDevice(g_dev, 0);
 }
 

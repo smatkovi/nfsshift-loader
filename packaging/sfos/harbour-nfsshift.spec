@@ -25,7 +25,7 @@
 %global debug_package %{nil}
 
 Name:       harbour-nfsshift
-Version:    0.1.0
+Version:    0.1.1
 Release:    1
 Summary:    Need for Speed Shift (Marmalade-Build) auf Sailfish OS
 License:    GPL-3.0-or-later
