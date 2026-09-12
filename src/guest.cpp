@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include <SDL.h>
+
 #include "dlmalloc.h"
 
 #ifndef MAP_FIXED_NOREPLACE
@@ -18,13 +20,22 @@
 #endif
 
 void fatal(const char *fmt, ...) {
+    char msg[512];
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "[fatal] ");
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
+    vsnprintf(msg, sizeof msg, fmt, ap);
     va_end(ap);
+    fprintf(stderr, "[fatal] %s\n", msg);
     fflush(stderr);
+    // On a phone stderr is nowhere to be seen: without this a fatal during
+    // startup is indistinguishable from "the app does not start". The box needs
+    // the video subsystem; before that it simply fails and we lose nothing.
+    // The guard is for a fatal raised from inside SDL itself.
+    static bool inside = false;
+    if (!inside) {
+        inside = true;
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "NFS Shift", msg, nullptr);
+    }
     abort();
 }
 
