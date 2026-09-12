@@ -1,0 +1,25 @@
+Package: nfsshift-mp
+Version: @VERSION@
+Section: user/games
+Priority: extra
+Architecture: armel
+Depends: nfsshift
+Installed-Size: 0
+Maintainer: smatkovi <sebastian.matkovich@gmail.com>
+Description: LAN multiplayer add-on for NFS Shift
+ Adds the missing network transport to the MeeGo build of Need for Speed
+ Shift. A small native library is loaded into the original game process with
+ LD_PRELOAD; it patches the game's own multiplayer code at run time and talks
+ UDP to other phones on the same Wi-Fi network (port 45470 for discovery,
+ 45471 for the session). Up to four players, cross-play with the Sailfish OS
+ and Android ports.
+ .
+ The original package "nfsshift" is left completely untouched - this package
+ only adds a second launcher called "NFS Shift LAN" next to it. Remove this
+ package and the game behaves exactly as before.
+ .
+ Contains no game data and no game code: the data belongs to the original
+ package that is already installed.
+Maemo-Display-Name: NFS Shift LAN
+Maemo-Icon-26:
+@ICON@

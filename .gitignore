@@ -1,0 +1,10 @@
+build/
+*.o
+*.rpm
+*.deb
+*.apk
+# Game data belongs to Electronic Arts and must never be committed here.
+*.s3e
+res.dz
+*.mp3
+EASplash.jpg

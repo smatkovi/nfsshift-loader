@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""harbour-nfsshift-import-data - Spieldaten aus der eigenen Kopie importieren.
+
+Das Paket harbour-nfsshift enthaelt nur unseren Loader.  Die rund 100 MB
+Spieldaten (NFSShift.s3e, res.dz, 18 MP3s, Splashscreens) sind unveraendertes
+Material von Electronic Arts und werden nicht mitgeliefert.  Dieses Werkzeug
+holt sie aus einer Kopie, die der Nutzer selbst besitzt:
+
+  * aus der Original-Debian-Datei des N9-Spiels, z. B.
+    ~/Downloads/nfsshift_1.0.20.10m7_armel.deb   (ar-Archiv mit data.tar.gz),
+  * oder aus einem bereits entpackten Verzeichnis, das NFSShift.s3e und
+    res.dz enthaelt (z. B. /opt/ea-mobile-nfsshift von einer N9-Kopie).
+
+Aufruf (typisch, ohne Argumente - sucht selbst):
+
+    harbour-nfsshift-import-data
+
+Weitere Formen:
+
+    harbour-nfsshift-import-data ~/Downloads/nfsshift_1.0.20.10m7_armel.deb
+    harbour-nfsshift-import-data /run/media/defaultuser/SDCARD/ea-mobile-nfsshift
+    harbour-nfsshift-import-data --check           # nur Zustand anzeigen
+    harbour-nfsshift-import-data --list            # Fundstellen anzeigen
+    harbour-nfsshift-import-data --force           # neu importieren
+    harbour-nfsshift-import-data --target DIR      # anderes Zielverzeichnis
+    devel-su harbour-nfsshift-import-data --link   # /usr/share-Symlink richten
+
+Ziel ist ~/.local/share/harbour-nfsshift/data.  Der Loader selbst sucht seine
+Daten unter /usr/share/harbour-nfsshift/data; das RPM legt dort beim
+Installieren einen Symlink auf genau dieses Verzeichnis an (%post der .spec).
+Ist der Symlink weg oder wurde ein anderes Ziel gewaehlt, richtet --link ihn
+wieder ein (als root).  Ohne Paket laesst sich der Pfad auch direkt angeben:
+harbour-nfsshift --data ~/.local/share/harbour-nfsshift/data
+
+Das Werkzeug ist idempotent: ist alles schon da und stimmen die Pruefsummen,
+wird nichts geschrieben.  Es braucht nur die Python-Standardbibliothek
+(python3-base) - kein ar, kein tar, kein dpkg.
+"""
+
+import argparse
+import glob
+import hashlib
+import io
+import os
+import shutil
+import stat
+import sys
+import tarfile
+
+APP = "harbour-nfsshift"
+DEFAULT_TARGET = os.path.expanduser("~/.local/share/%s/data" % APP)
+SYSTEM_DATA = "/usr/share/%s/data" % APP
+
+# Verzeichnis im data.tar.gz des Originalpakets.
+DEB_PREFIX = "opt/ea-mobile-nfsshift/"
+
+# Die beiden Dateien, ohne die der Loader nicht startet, mit den Pruefsummen
+# der Fassung 1.0.20.10m7 (aus packaging-lan-design.md Abschnitt 4).
+REQUIRED = {
+    "NFSShift.s3e": (637560, "b60912562ba666c42f9fc899da4fff79aab92c8bb62ea90e03d47a989881abb2"),
+    "res.dz": (70441701, "964561dc1143de1f677cf9c434526985af65fae4232d51a7b23c8b3b47b200a7"),
+}
+
+# Grosszuegige Schaetzung fuer die Platzpruefung (99,0 MB entpackt).
+NEEDED_BYTES = 105 * 1024 * 1024
+
+quiet = False
+
+
+def say(fmt, *a):
+    if not quiet:
+        print(fmt % a if a else fmt)
+
+
+def die(fmt, *a):
+    sys.stderr.write("Fehler: " + (fmt % a if a else fmt) + "\n")
+    sys.exit(1)
+
+
+def sha256_file(path, limit=None):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1 << 20)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# ar (Debian-Paket-Huelle)
+
+
+class ArMember(object):
+    def __init__(self, name, offset, size):
+        self.name = name
+        self.offset = offset
+        self.size = size
+
+
+def ar_members(path):
+    """Liest die Mitgliederliste eines ar-Archivs (GNU- und BSD-Form)."""
+    out = []
+    with open(path, "rb") as f:
+        if f.read(8) != b"!<arch>\n":
+            return out
+        longnames = b""
+        while True:
+            hdr = f.read(60)
+            if len(hdr) < 60:
+                break
+            if hdr[58:60] != b"`\n":
+                break
+            name = hdr[0:16].decode("ascii", "replace").rstrip()
+            try:
+                size = int(hdr[48:58].decode("ascii").strip())
+            except ValueError:
+                break
+            data_off = f.tell()
+            if name == "//":
+                longnames = f.read(size)
+                f.seek(data_off + size + (size & 1))
+                continue
+            if name.startswith("/") and name[1:].isdigit() and longnames:
+                start = int(name[1:])
+                end = longnames.find(b"/\n", start)
+                if end < 0:
+                    end = len(longnames)
+                name = longnames[start:end].decode("ascii", "replace")
+            elif name.startswith("#1/"):  # BSD: Name steht vor den Daten
+                nlen = int(name[3:])
+                name = f.read(nlen).decode("ascii", "replace").rstrip("\0")
+                data_off += nlen
+                size -= nlen
+            name = name.rstrip("/")
+            out.append(ArMember(name, data_off, size))
+            f.seek(data_off + size + (size & 1))
+    return out
+
+
+class Slice(io.RawIOBase):
+    """Nur-lesende Sicht auf einen Ausschnitt einer Datei (fuer tarfile)."""
+
+    def __init__(self, path, offset, size):
+        self.f = open(path, "rb")
+        self.offset = offset
+        self.size = size
+        self.pos = 0
+        self.f.seek(offset)
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        left = self.size - self.pos
+        if left <= 0:
+            return 0
+        n = min(len(b), left)
+        data = self.f.read(n)
+        b[: len(data)] = data
+        self.pos += len(data)
+        return len(data)
+
+    def close(self):
+        try:
+            self.f.close()
+        finally:
+            io.RawIOBase.close(self)
+
+
+# ---------------------------------------------------------------------------
+# Quellen finden
+
+
+def deb_candidates():
+    home = os.path.expanduser("~")
+    pats = [
+        os.path.join(home, "Downloads", "nfsshift*.deb"),
+        os.path.join(home, "Downloads", "*", "nfsshift*.deb"),
+        os.path.join(home, "android_storage", "Download", "nfsshift*.deb"),
+        "/run/media/*/*/nfsshift*.deb",
+        "/media/sdcard/*/nfsshift*.deb",
+    ]
+    found = []
+    for p in pats:
+        found.extend(glob.glob(p))
+    # groesste zuerst: die echte .deb ist rund 103 MB
+    return sorted(set(found), key=lambda p: -os.path.getsize(p))
+
+
+def dir_candidates():
+    home = os.path.expanduser("~")
+    pats = [
+        "/opt/ea-mobile-nfsshift",
+        os.path.join(home, "Downloads", "ea-mobile-nfsshift"),
+        os.path.join(home, "Downloads", "opt", "ea-mobile-nfsshift"),
+        os.path.join(home, "Downloads", "*", "opt", "ea-mobile-nfsshift"),
+        "/run/media/*/*/ea-mobile-nfsshift",
+        "/run/media/*/*/opt/ea-mobile-nfsshift",
+    ]
+    found = []
+    for p in pats:
+        for d in glob.glob(p):
+            if os.path.isfile(os.path.join(d, "NFSShift.s3e")):
+                found.append(d)
+    return sorted(set(found))
+
+
+def resolve_dir(path):
+    """Liefert das Verzeichnis mit NFSShift.s3e in oder unter `path`."""
+    if os.path.isfile(os.path.join(path, "NFSShift.s3e")):
+        return path
+    for root, dirs, files in os.walk(path):
+        if "NFSShift.s3e" in files:
+            return root
+        # nicht endlos tief graben
+        if root[len(path):].count(os.sep) >= 4:
+            dirs[:] = []
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Zustand
+
+
+def status(target):
+    """(vollstaendig, Liste von Meldungen)"""
+    msgs = []
+    ok = True
+    for name, (size, digest) in sorted(REQUIRED.items()):
+        p = os.path.join(target, name)
+        if not os.path.isfile(p):
+            msgs.append("  fehlt     %s" % name)
+            ok = False
+            continue
+        have = os.path.getsize(p)
+        if have != size:
+            msgs.append("  Groesse!  %s (%d B, erwartet %d)" % (name, have, size))
+            ok = False
+            continue
+        msgs.append("  vorhanden %s (%d B)" % (name, have))
+    return ok, msgs
+
+
+def verify(target):
+    bad = []
+    for name, (size, digest) in sorted(REQUIRED.items()):
+        p = os.path.join(target, name)
+        if not os.path.isfile(p):
+            bad.append("%s fehlt" % name)
+            continue
+        got = sha256_file(p)
+        if got != digest:
+            bad.append("%s: sha256 %s, erwartet %s" % (name, got[:16], digest[:16]))
+        else:
+            say("  sha256 ok %s", name)
+    return bad
+
+
+def free_bytes(path):
+    d = path
+    while d and not os.path.isdir(d):
+        d = os.path.dirname(d)
+    st = os.statvfs(d or "/")
+    return st.f_bavail * st.f_frsize
+
+
+# ---------------------------------------------------------------------------
+# Import
+
+
+def import_from_deb(deb, target):
+    members = ar_members(deb)
+    if not members:
+        die("%s ist kein ar-Archiv (keine .deb?)", deb)
+    names = [m.name for m in members]
+    data = None
+    for m in members:
+        if m.name.startswith("data.tar"):
+            data = m
+            break
+    if data is None:
+        die("kein data.tar.* in %s (enthalten: %s)", deb, ", ".join(names))
+    say("Quelle:  %s", deb)
+    say("Mitglieder: %s", ", ".join("%s (%d B)" % (m.name, m.size) for m in members))
+
+    sl = Slice(deb, data.offset, data.size)
+    count = 0
+    total = 0
+    try:
+        tf = tarfile.open(fileobj=io.BufferedReader(sl), mode="r|*")
+        prefix = DEB_PREFIX
+        for ti in tf:
+            name = ti.name
+            if name.startswith("./"):
+                name = name[2:]
+            if not name.startswith(prefix):
+                continue
+            rel = name[len(prefix):]
+            if not rel or not ti.isreg():
+                continue
+            count += write_member(tf, ti, target, rel)
+            total += ti.size
+    finally:
+        sl.close()
+    if count == 0:
+        die("in %s liegt nichts unter ./%s - falsche .deb?", deb, DEB_PREFIX)
+    say("%d Dateien, %.1f MB", count, total / 1048576.0)
+
+
+def write_member(tf, ti, target, rel):
+    rel = rel.replace("\\", "/").lstrip("/")
+    if ".." in rel.split("/"):
+        say("  uebersprungen (Pfad) %s", rel)
+        return 0
+    dst = os.path.join(target, rel)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    src = tf.extractfile(ti)
+    if src is None:
+        return 0
+    tmp = dst + ".part"
+    with open(tmp, "wb") as out:
+        shutil.copyfileobj(src, out, 1 << 20)
+    os.replace(tmp, dst)
+    mode = 0o755 if (ti.mode & 0o111) else 0o644
+    os.chmod(dst, mode)
+    say("  %-44s %9d B", rel, ti.size)
+    return 1
+
+
+def import_from_dir(src, target):
+    say("Quelle:  %s (bereits entpackt)", src)
+    count = 0
+    total = 0
+    for root, dirs, files in os.walk(src):
+        for fn in sorted(files):
+            sp = os.path.join(root, fn)
+            rel = os.path.relpath(sp, src)
+            dst = os.path.join(target, rel)
+            if os.path.islink(sp):
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            tmp = dst + ".part"
+            shutil.copyfile(sp, tmp)
+            os.replace(tmp, dst)
+            os.chmod(dst, 0o755 if os.stat(sp).st_mode & stat.S_IXUSR else 0o644)
+            sz = os.path.getsize(dst)
+            say("  %-44s %9d B", rel, sz)
+            count += 1
+            total += sz
+    if count == 0:
+        die("%s ist leer", src)
+    say("%d Dateien, %.1f MB", count, total / 1048576.0)
+
+
+# ---------------------------------------------------------------------------
+# /usr/share-Symlink
+
+
+def link_system(target):
+    parent = os.path.dirname(SYSTEM_DATA)
+    if os.path.islink(SYSTEM_DATA) and os.readlink(SYSTEM_DATA) == target:
+        say("Symlink %s -> %s steht bereits.", SYSTEM_DATA, target)
+        return 0
+    if os.path.isdir(SYSTEM_DATA) and not os.path.islink(SYSTEM_DATA):
+        die("%s ist ein echtes Verzeichnis (Datenpaket installiert?) - nichts geaendert.",
+            SYSTEM_DATA)
+    if os.geteuid() != 0:
+        sys.stderr.write(
+            "Fuer den Symlink werden Root-Rechte gebraucht:\n"
+            "    devel-su %s --link --target %s\n" % (sys.argv[0], target))
+        return 1
+    try:
+        os.makedirs(parent, exist_ok=True)
+        tmp = SYSTEM_DATA + ".new"
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        os.symlink(target, tmp)
+        os.replace(tmp, SYSTEM_DATA)
+    except OSError as e:
+        die("Symlink %s: %s", SYSTEM_DATA, e)
+    say("Symlink %s -> %s angelegt.", SYSTEM_DATA, target)
+    return 0
+
+
+def report_system(target):
+    if os.path.islink(SYSTEM_DATA):
+        t = os.readlink(SYSTEM_DATA)
+        ok = os.path.isdir(SYSTEM_DATA)
+        say("%s -> %s%s", SYSTEM_DATA, t, "" if ok else "   (Ziel fehlt!)")
+    elif os.path.isdir(SYSTEM_DATA):
+        say("%s ist ein Verzeichnis (Paket harbour-nfsshift-data?)", SYSTEM_DATA)
+    else:
+        say("%s existiert nicht - der Loader findet die Daten nur mit", SYSTEM_DATA)
+        say("    harbour-nfsshift --data %s", target)
+        say("oder nach  devel-su %s --link", os.path.basename(sys.argv[0]))
+
+
+# ---------------------------------------------------------------------------
+
+
+def main():
+    global quiet
+    ap = argparse.ArgumentParser(
+        prog="harbour-nfsshift-import-data",
+        description="Importiert die Spieldaten von Need for Speed Shift aus einer "
+                    "eigenen Kopie des Originals.")
+    ap.add_argument("source", nargs="?",
+                    help=".deb-Datei oder Verzeichnis mit NFSShift.s3e (ohne Angabe wird gesucht)")
+    ap.add_argument("--target", default=DEFAULT_TARGET,
+                    help="Zielverzeichnis (Vorgabe: %s)" % DEFAULT_TARGET)
+    ap.add_argument("--force", action="store_true", help="auch importieren, wenn schon da")
+    ap.add_argument("--check", action="store_true", help="nur Zustand und Pruefsummen zeigen")
+    ap.add_argument("--list", action="store_true", help="gefundene Quellen zeigen")
+    ap.add_argument("--link", action="store_true",
+                    help="/usr/share/harbour-nfsshift/data auf das Ziel zeigen lassen (root)")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+    quiet = args.quiet
+
+    target = os.path.abspath(os.path.expanduser(args.target))
+
+    if args.list:
+        debs = deb_candidates()
+        dirs = dir_candidates()
+        print("Gefundene .deb-Dateien:")
+        for d in debs:
+            print("  %s (%d B)" % (d, os.path.getsize(d)))
+        if not debs:
+            print("  (keine)")
+        print("Gefundene entpackte Verzeichnisse:")
+        for d in dirs:
+            print("  %s" % d)
+        if not dirs:
+            print("  (keine)")
+        return 0
+
+    if args.link and not args.source:
+        return link_system(target)
+
+    complete, msgs = status(target)
+    if args.check:
+        say("Ziel:    %s", target)
+        for m in msgs:
+            say("%s", m)
+        bad = verify(target) if complete else ["unvollstaendig"]
+        report_system(target)
+        if bad:
+            for b in bad:
+                say("  ABWEICHUNG %s", b)
+            return 1
+        say("Daten vollstaendig.")
+        return 0
+
+    if complete and not args.force:
+        say("Ziel:    %s", target)
+        for m in msgs:
+            say("%s", m)
+        say("Schon importiert - nichts zu tun (--force erzwingt den Import).")
+        report_system(target)
+        return 0
+
+    # Quelle bestimmen
+    src = args.source
+    if src:
+        src = os.path.abspath(os.path.expanduser(src))
+        if not os.path.exists(src):
+            die("%s gibt es nicht", src)
+    else:
+        debs = deb_candidates()
+        dirs = dir_candidates()
+        if debs:
+            src = debs[0]
+        elif dirs:
+            src = dirs[0]
+        else:
+            die("Keine Quelle gefunden.  Bitte die Original-.deb nach ~/Downloads legen\n"
+                "       (z. B. nfsshift_1.0.20.10m7_armel.deb) oder den Pfad angeben.\n"
+                "       '%s --list' zeigt, wo gesucht wird." % os.path.basename(sys.argv[0]))
+
+    if free_bytes(target) < NEEDED_BYTES:
+        die("zu wenig Platz unter %s (%.1f MB frei, %.0f MB noetig)",
+            target, free_bytes(target) / 1048576.0, NEEDED_BYTES / 1048576.0)
+
+    os.makedirs(target, exist_ok=True)
+    say("Ziel:    %s", target)
+
+    if os.path.isdir(src):
+        d = resolve_dir(src)
+        if not d:
+            die("in %s liegt keine NFSShift.s3e", src)
+        import_from_dir(d, target)
+    else:
+        import_from_deb(src, target)
+
+    complete, msgs = status(target)
+    for m in msgs:
+        say("%s", m)
+    bad = verify(target)
+    if bad:
+        for b in bad:
+            say("  ABWEICHUNG %s", b)
+        say("Die Daten weichen von der Fassung 1.0.20.10m7 ab.  Das kann an einer")
+        say("anderen Spielversion liegen; der Loader ist auf 1.0.20 abgestimmt.")
+    if not complete:
+        die("Import unvollstaendig.")
+
+    say("Fertig.")
+    if args.link:
+        link_system(target)
+    else:
+        report_system(target)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

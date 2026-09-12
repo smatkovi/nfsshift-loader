@@ -1,0 +1,7 @@
+[Desktop Entry]
+Encoding=UTF-8
+Version=1.0.20.1
+Type=Application
+Name=NFS Shift LAN
+Icon=/usr/share/themes/base/meegotouch/icons/nfsshift-mp-80.png
+Exec=/opt/nfsshift-mp/startup-mp.sh

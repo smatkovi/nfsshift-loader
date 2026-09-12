@@ -1,0 +1,28 @@
+[Desktop Entry]
+Type=Application
+Name=NFS Shift
+GenericName=Racing game
+Comment=Need for Speed Shift with LAN multiplayer
+Icon=harbour-nfsshift
+Exec=harbour-nfsshift
+Terminal=false
+StartupNotify=false
+Categories=Game;ArcadeGame;
+# "generic" ist die auf diesem Geraet belegte Variante fuer ein SDL-Programm
+# ohne mapplauncherd-Booster: /usr/share/applications/supertuxkart.desktop
+# benutzt genau diesen Wert.  "no-invoker" tut dasselbe expliziter.
+X-Nemo-Application-Type=generic
+
+[X-Sailjail]
+OrganizationName=org.smatkovi
+ApplicationName=harbour-nfsshift
+# Internet: Base.permission setzt "net none"; ohne Internet bekommt die App
+#           ueberhaupt keinen Socket - UDP 45470/45471 waeren tot.
+# Audio:    Base.permission setzt "nosound"; der Loader startet SDL mit
+#           SDL_INIT_AUDIO (src/display.cpp:117).
+# Dieselbe Kombination benutzt supertuxkart auf diesem Geraet.
+# Sensors:  gelenkt wird durch Neigen; QAccelerometer::connectToBackend()
+#           (src/sensors.cpp) braucht dafuer das sensorfw-Backend, das ueber
+#           "dbus-system.talk com.nokia.SensorService" aus Sensors.permission
+#           kommt. Ohne die Zeile laeuft das Spiel, aber ohne Lenkung.
+Permissions=Internet;Audio;Sensors
