@@ -16,6 +16,8 @@ using addr_t = uint32_t;
 namespace layout {
 constexpr addr_t ARENA_BASE = 0x08000000;  // loader-owned objects visible to the guest
 constexpr size_t ARENA_SIZE = 0x08000000;
+// The heap window is a wish, not a law: in an Android process ART already
+// owns parts of it, so hle_memory.cpp asks find_free_span() what is free.
 constexpr addr_t HEAP_BASE = 0x10000000;   // s3e heaps (MemSize0..)
 constexpr size_t HEAP_SPAN = 0x30000000;
 constexpr addr_t STACK_BASE = 0x60000000;  // per-thread guest stacks
@@ -37,6 +39,11 @@ inline addr_t gaddr(const void *p) {
 namespace guest {
 // Reserve and map [start, start+size) read/write at exactly that address.
 bool map_fixed(addr_t start, size_t size);
+// Pick a window of `want` bytes below 4 GB that no mapping occupies: `preferred`
+// when that address is free, otherwise the start of the largest free gap (1 MB
+// aligned).  *got is the usable size there, at most `want`; the return value is
+// 0 when not even `least` bytes are free anywhere.
+addr_t find_free_span(addr_t preferred, size_t want, size_t least, size_t *got);
 // Print every existing mapping below 4 GB (diagnostic for map_fixed failures).
 void dump_low_mappings();
 bool is_mapped(addr_t addr);

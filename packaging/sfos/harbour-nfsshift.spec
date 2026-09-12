@@ -37,7 +37,7 @@
 %global debug_package %{nil}
 
 Name:       harbour-nfsshift
-Version:    0.1.2
+Version:    0.1.3
 Release:    1%{?relsuffix}
 Summary:    Need for Speed Shift (Marmalade-Build) auf Sailfish OS %{?datasummary}
 License:    GPL-3.0-or-later %{?datalicense}
@@ -175,5 +175,10 @@ exit 0
 
 
 %changelog
+* Sat Sep 12 2026 smatkovi <sebastian.matkovich@gmail.com> - 0.1.3-1
+- Heap-Fenster wird zur Laufzeit gesucht, statt 0x10000000 zu erzwingen
+  (noetig unter Android, wo ART mitten im Wunschbereich liegt; auf Sailfish
+  unveraendert)
+
 * Sat Sep 12 2026 smatkovi <sebastian.matkovich@gmail.com> - 0.1.0-1
 - Erste Fassung: Loader plus LAN-Mehrspielermodus, Datenimport statt Spieldaten

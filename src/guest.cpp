@@ -1,5 +1,6 @@
 #include "guest.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdarg>
 #include <cstring>
@@ -7,6 +8,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "dlmalloc.h"
@@ -62,6 +64,66 @@ void dump_low_mappings() {
         if (lo < 0x100000000ul) fprintf(stderr, "  %s", line);
     }
     fclose(f);
+}
+
+namespace {
+constexpr uint64_t kLowLimit = 0x100000000ull;  // guest addresses are 32 bit
+// Every mapping below 4 GB as [begin, end), sorted.
+std::vector<std::pair<uint64_t, uint64_t>> low_mappings() {
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return out;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char *dash = nullptr;
+        uint64_t lo = strtoull(line, &dash, 16);
+        if (!dash || *dash != '-') continue;
+        uint64_t hi = strtoull(dash + 1, nullptr, 16);
+        if (hi <= lo || lo >= kLowLimit) continue;
+        out.push_back({lo, std::min(hi, kLowLimit)});
+    }
+    fclose(f);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+}  // namespace
+
+addr_t find_free_span(addr_t preferred, size_t want, size_t least, size_t *got) {
+    // The lowest 16 MB stay untouched: mmap_min_addr, the ELF of the process
+    // itself and its brk live down there, and nothing is gained by squeezing in.
+    constexpr uint64_t kFloor = 0x01000000ull;
+    constexpr uint64_t kAlign = 0x100000ull;  // 1 MB, the step the heaps use
+    *got = 0;
+
+    std::vector<std::pair<uint64_t, uint64_t>> gaps;
+    uint64_t at = kFloor;
+    for (const auto &m : low_mappings()) {
+        if (m.second <= at) continue;
+        if (m.first > at) gaps.push_back({at, m.first});
+        at = m.second;
+    }
+    if (at < kLowLimit) gaps.push_back({at, kLowLimit});
+
+    // The wish first -- on Sailfish and the N9 it is simply free, and then the
+    // layout stays the one that has been tested there.
+    for (const auto &g : gaps)
+        if (preferred >= g.first && static_cast<uint64_t>(preferred) + want <= g.second) {
+            *got = want;
+            return preferred;
+        }
+
+    uint64_t best_base = 0, best_size = 0;
+    for (const auto &g : gaps) {
+        uint64_t b = (g.first + kAlign - 1) & ~(kAlign - 1);
+        if (b >= g.second) continue;
+        if (g.second - b > best_size) {
+            best_size = g.second - b;
+            best_base = b;
+        }
+    }
+    if (best_size < least) return 0;
+    *got = static_cast<size_t>(std::min<uint64_t>(want, best_size));
+    return static_cast<addr_t>(best_base);
 }
 
 bool map_fixed(addr_t start, size_t size) {

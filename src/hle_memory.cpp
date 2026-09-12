@@ -29,7 +29,15 @@ struct Heap {
 std::recursive_mutex g_mutex;
 Heap g_heaps[kHeaps];
 int32_t g_current;
+// Where the heaps really end up: layout::HEAP_BASE is only the wish, an
+// Android process has ART sitting in the middle of that window (see
+// place_heaps_window()).
+addr_t g_heap_base = layout::HEAP_BASE;
+size_t g_heap_span = layout::HEAP_SPAN;
 addr_t g_next_base = layout::HEAP_BASE;
+// Heap 6 alone reserves 256 MB (OS_DIRECT), the configured ones came to 54 MB
+// in the MeeGo build: below this a start is not worth trying.
+constexpr size_t kHeapLeast = 320u << 20;
 bool g_initialized;
 uint32_t g_user_mgr[3];  // guest {malloc, realloc, free}
 
@@ -48,7 +56,8 @@ bool create(int i) {
     // Reserve generously: the GLES2 renderer needs more than the N9 did.
     size_t want = (h.flags & FLAG_OS_DIRECT) ? 256u << 20 : std::max<size_t>(size_t(h.size) * 4, 1u << 20);
     want = (want + 0xfffff) & ~size_t(0xfffff);
-    if (g_next_base + want > layout::HEAP_BASE + layout::HEAP_SPAN) fatal("guest heap span exhausted");
+    if (static_cast<uint64_t>(g_next_base) + want > static_cast<uint64_t>(g_heap_base) + g_heap_span)
+        fatal("guest heap span exhausted");
     if (!guest::map_fixed(g_next_base, want)) fatal("cannot map heap %d", i);
     h.base = g_next_base;
     h.capacity = want;
@@ -58,9 +67,32 @@ bool create(int i) {
     return true;
 }
 
+// The heaps sit at a fixed address in the guest's low 4 GB. On Sailfish and on
+// the N9 that address is free; in an Android process it is not -- ART puts the
+// Java heap at 0x14000000 and its large object space around 0x3fb00000, both
+// inside the window, so the first heap past 0x13600000 died in map_fixed()
+// ("cannot map heap 6") and the app went down before the first frame. Ask the
+// kernel what is actually free instead of insisting on the wish.
+void place_heaps_window() {
+    size_t got = 0;
+    addr_t base = guest::find_free_span(layout::HEAP_BASE, layout::HEAP_SPAN, kHeapLeast, &got);
+    if (!base) {
+        logf("[mem] no free window of %zu MB below 4 GB, mappings:", kHeapLeast >> 20);
+        guest::dump_low_mappings();
+        fatal("no room for the guest heaps below 4 GB");
+    }
+    g_heap_base = base;
+    g_heap_span = got;
+    g_next_base = base;
+    if (base != layout::HEAP_BASE || got != layout::HEAP_SPAN)
+        logf("[mem] heap window moved to %#x + %zu MB (wanted %#x + %zu MB)", base, got >> 20,
+             layout::HEAP_BASE, layout::HEAP_SPAN >> 20);
+}
+
 void init_heaps() {
     if (g_initialized) return;
     g_initialized = true;
+    place_heaps_window();
     for (int i = 0; i < kHeaps; ++i) {
         Heap &h = g_heaps[i];
         int size = config::get_int("s3e", "MemSize" + std::to_string(i), -1);
