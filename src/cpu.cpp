@@ -125,9 +125,15 @@ Cpu::Cpu(const char *name) : name_(name), callbacks_(std::make_unique<Callbacks>
     static addr_t next_stack = layout::STACK_BASE;
     {
         std::lock_guard<std::mutex> lock(stack_mutex);
-        if (!guest::map_fixed(next_stack, layout::STACK_SIZE)) fatal("cannot map guest stack at %#x", next_stack);
-        stack_top_ = next_stack + layout::STACK_SIZE - 16;
-        next_stack += layout::STACK_SIZE + 0x10000;
+        // STACK_BASE is a wish as well: a stack goes to the next free 4 MB
+        // window when the planned one is taken (see guest::find_free_span).
+        size_t got = 0;
+        addr_t base = guest::find_free_span(next_stack, layout::STACK_SIZE, layout::STACK_SIZE, &got);
+        if (!base || !guest::map_fixed(base, layout::STACK_SIZE))
+            fatal("cannot map a guest stack (wanted %#x)", next_stack);
+        if (base != next_stack) logf("[cpu] stack for %s moved to %#x (wanted %#x)", name, base, next_stack);
+        stack_top_ = base + layout::STACK_SIZE - 16;
+        next_stack = base + layout::STACK_SIZE + 0x10000;
     }
 
     Dynarmic::A32::UserConfig config;

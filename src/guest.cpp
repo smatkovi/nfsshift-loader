@@ -123,14 +123,26 @@ addr_t find_free_span(addr_t preferred, size_t want, size_t least, size_t *got) 
             return preferred;
         }
 
-    uint64_t best_base = 0, best_size = 0;
+    // Otherwise the smallest gap that holds all of `want` -- a 128 MB arena
+    // placed first must not eat the one big window the heaps need afterwards --
+    // and only when no gap is that big, the largest that still holds `least`.
+    uint64_t fit_base = 0, fit_size = ~0ull, best_base = 0, best_size = 0;
     for (const auto &g : gaps) {
         uint64_t b = (g.first + kAlign - 1) & ~(kAlign - 1);
         if (b >= g.second) continue;
-        if (g.second - b > best_size) {
-            best_size = g.second - b;
+        uint64_t size = g.second - b;
+        if (size >= want && size < fit_size) {
+            fit_size = size;
+            fit_base = b;
+        }
+        if (size > best_size) {
+            best_size = size;
             best_base = b;
         }
+    }
+    if (fit_base) {
+        *got = want;
+        return static_cast<addr_t>(fit_base);
     }
     if (best_size < least) return 0;
     *got = static_cast<size_t>(std::min<uint64_t>(want, best_size));
@@ -166,11 +178,26 @@ bool map_fixed(addr_t start, size_t size) {
 
 bool is_mapped(addr_t addr) { return g_page_map[addr >> 12] != 0; }
 
+// Like the heaps, the arena only wishes for ARENA_BASE: on a Huawei phone that
+// address was taken and the loader died in "cannot map guest arena at
+// 0x8000000". Nothing in the guest cares where the arena is -- it only sees the
+// pointers it is handed -- so it goes wherever there is room. The s3e image is
+// mapped before the first allocation from here, so the arena cannot take its
+// place.
 static void ensure_arena() {
     if (g_arena) return;
-    if (!map_fixed(layout::ARENA_BASE, layout::ARENA_SIZE))
-        fatal("cannot map guest arena at %#x", layout::ARENA_BASE);
-    g_arena = create_mspace_with_base(gptr(layout::ARENA_BASE), layout::ARENA_SIZE, 0);
+    constexpr size_t kArenaLeast = 32u << 20;
+    size_t size = 0;
+    addr_t base = find_free_span(layout::ARENA_BASE, layout::ARENA_SIZE, kArenaLeast, &size);
+    if (!base || !map_fixed(base, size)) {
+        logf("[guest] no room for the arena, mappings below 4 GB:");
+        dump_low_mappings();
+        fatal("cannot map guest arena (wanted %#x)", layout::ARENA_BASE);
+    }
+    if (base != layout::ARENA_BASE || size != layout::ARENA_SIZE)
+        logf("[guest] arena moved to %#x + %zu MB (wanted %#x + %zu MB)", base, size >> 20, layout::ARENA_BASE,
+             layout::ARENA_SIZE >> 20);
+    g_arena = create_mspace_with_base(gptr(base), size, 0);
 }
 
 addr_t alloc(size_t size) {

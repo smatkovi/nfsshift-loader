@@ -89,10 +89,15 @@ bool s3e_load(const std::string &path, S3eImage &out) {
     logf("[s3e] version %#x base %#x image %#x mem %#x entry +%#x", h.version, h.base, h.image_size, h.mem_size,
          h.entry);
 
-    if (!guest::map_fixed(h.base, h.mem_size)) {
-        logf("[s3e] cannot map image at %#x", h.base);
-        return false;
-    }
+    // The image is linked to this address and cannot move: the relocation
+    // section (type 1 below) is not applied, and the LAN patch tables in
+    // src/mp/patches.c address the image directly. So a collision here is the
+    // end -- but it must say so on screen: returning false used to end the app
+    // without a word, which on a phone looks exactly like "it does not start".
+    if (!guest::map_fixed(h.base, h.mem_size))
+        fatal("the game image needs %#x-%#x, but that address range is already in use "
+              "(the log lists what is there)",
+              h.base, h.base + h.mem_size);
     memcpy(gptr(h.base), d.data() + h.image_offset, h.image_size);
     out.base = h.base;
     out.image_size = h.image_size;
