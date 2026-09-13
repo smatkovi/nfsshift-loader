@@ -10,14 +10,12 @@ Sailfish OS, Android und der originalen N9.
 > steckt ausschließlich eigener Code. Zum Spielen braucht man die eigene Kopie
 > des Originalpakets; der Import läuft beim ersten Start.
 >
-> Einzige Ausnahme ist das private Release **v0.1.2-full**: dieses eine RPM
-> bringt die Spieldaten mit, damit auf den eigenen Geräten nichts mehr
-> importiert werden muss. Es darf dieses Repo nicht verlassen.
+> Pakete, die mit den eigenen Spieldaten gebaut werden (`--gamedata` bzw.
+> `GAMEDATA`), werden hier nicht veröffentlicht.
 >
 > Die Icons unter `packaging/*/icons/` sind aus dem Icon des Originalpakets
-> abgeleitet und damit ebenfalls EA-Material — deshalb ist dieses Repo privat.
-> Für eine Veröffentlichung müsste `packaging/make-icons.py` durch ein eigenes
-> Motiv ersetzt werden.
+> abgeleitet und damit ebenfalls EA-Material; sie müssen noch durch ein eigenes
+> Motiv ersetzt werden (`packaging/make-icons.py`).
 
 ## Zwei Wege auf zwei Geräte
 

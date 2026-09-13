@@ -306,10 +306,10 @@ AF_INET-Sockets gibt es dort auch keine.
   dort bringt der Nutzer seine eigene Kopie mit, `harbour-nfsshift-import-data`
   holt sie ab. Nur diese Pakete duerfen ueber Chum/OpenRepos oder ein
   oeffentliches GitHub-Release gehen.
-* Die Vollpakete aus `--gamedata`/`GAMEDATA` (RPM `-1full`, APK `1.0-full`)
+* Die Vollpakete aus `--gamedata`/`GAMEDATA` (RPM `-1full`, APK `-full`)
   enthalten diese Daten und sind ausschliesslich fuer die eigenen Geraete. Sie
-  liegen in den privaten Repos `nfsshift-loader` und `nfsshift-android` und
-  duerfen dort nicht oeffentlich werden.
+  werden nie zusammen mit dem Code veroeffentlicht — weder als Release dieses
+  Repos noch sonstwo —, sondern liegen in einem eigenen privaten Repo.
 * **Das Icon** ist aus dem 80×80-Icon des Originalpakets hochskaliert und damit
   ebenfalls EA-Material. Fuer den privaten Gebrauch auf dem eigenen Geraet ist
   das unproblematisch; **vor einer Veroeffentlichung muss es durch ein eigenes
