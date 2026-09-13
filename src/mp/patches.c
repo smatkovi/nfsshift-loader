@@ -43,6 +43,15 @@ const struct mp_patch mp_code_patches[] = {
     // MPM_GetLocalPeerField04 overwrites its index argument, so the lobby
     // shows the local car in every row. Dropping the load fixes the column.
     {0x4a0a8160, 0xe5901010, 0xe1a00000, "lobby car column: keep the index"},
+
+    // Screen element lookup (0x4a0a2fc4): `index < count` is a signed compare,
+    // so index -1 -- which the function means to ignore, see the
+    // `cmn r1,#1; bxeq lr` right behind it -- falls through to array[-1]. The
+    // lobby build loop at 0x4a08d1f4 feeds it -1 for elements the current
+    // layout does not have, and on a screen without any element list that is
+    // a read of 0xfffffffc: the N9 died right there when "ready" was tapped.
+    // Unsigned: -1 is out of range and takes the path that returns.
+    {0x4a0a2fcc, 0xda000005, 0x9a000005, "element lookup: ble -> bls"},
 };
 const size_t mp_code_patch_count = sizeof mp_code_patches / sizeof mp_code_patches[0];
 

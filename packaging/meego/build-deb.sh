@@ -29,7 +29,7 @@ OUTDIR="$HERE/build/meego"
 HOST=$(BUILD_HOST="$BUILD_HOST" sh "$(cd "$(dirname "$0")/../.." && pwd)/tools/buildhost.sh")
 MADDE=${MADDE_GCC:-\$HOME/QtSDK/Madde/targets/harmattan_10.2011.34-1_rt1.2/bin/gcc}
 
-VERSION=${VERSION:-0.1.0}
+VERSION=${VERSION:-0.1.1}
 SO=
 FORCE_STUB=
 
@@ -54,7 +54,8 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/DEBIAN" \
          "$STAGE/opt/nfsshift-mp" \
          "$STAGE/usr/share/applications" \
-         "$STAGE/usr/share/themes/base/meegotouch/icons"
+         "$STAGE/usr/share/themes/base/meegotouch/icons" \
+         "$STAGE/usr/share/doc/nfsshift-mp"
 
 # --- 1. Bibliothek besorgen -------------------------------------------------
 make_remote_stub() {
@@ -104,8 +105,12 @@ chmod 755                        "$STAGE/opt/nfsshift-mp/startup-mp.sh"
 cp "$PKGDIR/nfsshift-mp.desktop" "$STAGE/usr/share/applications/nfsshift-mp.desktop"
 cp "$PKGDIR/icons/nfsshift-mp-80.png" \
    "$STAGE/usr/share/themes/base/meegotouch/icons/nfsshift-mp-80.png"
+# Debian-Changelog: gzip -n, damit zwei Laeufe dieselbe Datei liefern (kein
+# Name, kein Zeitstempel im Kopf).
+gzip -9nc "$PKGDIR/changelog" > "$STAGE/usr/share/doc/nfsshift-mp/changelog.gz"
 chmod 644 "$STAGE/usr/share/applications/nfsshift-mp.desktop" \
-          "$STAGE/usr/share/themes/base/meegotouch/icons/nfsshift-mp-80.png"
+          "$STAGE/usr/share/themes/base/meegotouch/icons/nfsshift-mp-80.png" \
+          "$STAGE/usr/share/doc/nfsshift-mp/changelog.gz"
 
 # --- 3. control aus control.in ----------------------------------------------
 # Maemo-Icon-26 ist ein 64x64-PNG als base64, Folgezeilen mit genau einem

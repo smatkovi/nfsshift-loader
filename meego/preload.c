@@ -33,9 +33,11 @@
  * das eintreten koennte, sind unten mit SOFTFP markiert.
  */
 #define _GNU_SOURCE
+#include <alloca.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -43,7 +45,9 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <sys/syscall.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include "nfsmp.h"
@@ -104,6 +108,7 @@
  * Zustand
  */
 static unsigned char *g_code;   /* Host-Adresse von Gast 0x4a000000        */
+static uint32_t g_memsz;        /* Groesse des Abbilds (fuer den Absturzbericht) */
 static unsigned char *g_data;   /* Host-Adresse von Gast 0x4a000000+split  */
 static uint32_t g_split;        /* 0x1c1078                                */
 static uint32_t g_datasz;       /* memsz - split                           */
@@ -299,16 +304,71 @@ struct mp_sample_tail {
 typedef void (*guest_push_fn)(void *peer, uint32_t w0, uint32_t w1, uint32_t w2,
                               struct mp_sample_tail tail);
 
+/* Gegner-Samples werden NICHT sofort ins Spiel geschrieben, sondern
+ * eingereiht und erst eingefuegt, wenn das Spiel selbst einen unserer Stubs
+ * ruft (flush_samples() in jedem t_*-Thunk unten).
+ *
+ * Grund, auf der N9 nachgemessen: plat_push_sample laeuft aus mp_pump, also aus
+ * dem s3eDeviceYield-Hook -- mitten in einem Laufzeitaufruf. Muss die
+ * Spielfunktion (push_back auf die Gegner-Historie) dabei den Vektor
+ * vergroessern, ruft sie den Allokator der Laufzeit, und dieser verschachtelte
+ * Import legt seinen Rahmen ueber unsere noch lebenden Rahmen: drain()s
+ * Ruecksprungadresse stand danach auf 0xa4 bzw. 0x148 -- genau die
+ * Allokationsgroesse 1x bzw. 2x Sample -- und das Spiel stuerzte beim gruenen
+ * Licht ab. Aus einem Stub heraus ist es derselbe Kontext, in dem das Spiel
+ * seine eigenen Allokationen macht. Der Loader kennt diese Thunks nicht und
+ * schreibt weiter sofort.
+ */
+#define SAMPLE_QUEUE 64
+struct queued_sample {
+    uint32_t peer;
+    uint8_t data[MP_SAMPLE_SIZE];
+};
+static struct queued_sample g_sq[SAMPLE_QUEUE];
+static unsigned g_sq_head, g_sq_count;
+static unsigned g_sq_in, g_sq_out, g_sq_drop;
+
 static void plat_push_sample(uint32_t peer_addr, const void *sample)
+{
+    struct queued_sample *q;
+    if (!g_code || !peer_addr)
+        return;
+    if (g_sq_count == SAMPLE_QUEUE) { /* voll: das aelteste faellt weg */
+        g_sq_head = (g_sq_head + 1) % SAMPLE_QUEUE;
+        g_sq_count--;
+        g_sq_drop++;
+    }
+    q = &g_sq[(g_sq_head + g_sq_count) % SAMPLE_QUEUE];
+    q->peer = peer_addr;
+    memcpy(q->data, sample, MP_SAMPLE_SIZE);
+    g_sq_count++;
+    g_sq_in++;
+}
+
+static void push_now(uint32_t peer_addr, const uint8_t *sample)
 {
     guest_push_fn push = (guest_push_fn)(uintptr_t)g2h(MP_ADDR_PUSH_HISTORY);
     struct mp_sample_tail tail;
     uint32_t w[3];
-    if (!g_code || !peer_addr)
-        return;
     memcpy(w, sample, sizeof w);
-    memcpy(tail.b, (const uint8_t *)sample + 12, sizeof tail.b);
+    memcpy(tail.b, sample + 12, sizeof tail.b);
     push(g2h(peer_addr), w[0], w[1], w[2], tail);
+}
+
+static void flush_samples(void)
+{
+    static int busy;
+    if (busy || !g_sq_count)
+        return;
+    busy = 1;
+    while (g_sq_count) {
+        struct queued_sample q = g_sq[g_sq_head];
+        g_sq_head = (g_sq_head + 1) % SAMPLE_QUEUE;
+        g_sq_count--;
+        push_now(q.peer, q.data);
+        g_sq_out++;
+    }
+    busy = 0;
 }
 
 /* Beliebige Gastfunktion mit bis zu vier Integer-/Zeigerargumenten rufen.
@@ -416,41 +476,41 @@ static void *make_guest_string(const char *text)
  *             Rueckgabeslot, der Rueckgabewert ist wieder r0.
  * SOFTFP: alle rein Zeiger/Integer.
  */
-static void t_host_lobby_reenter(void *m) { mp_host_lobby_reenter(h2g(m)); }
-static void t_enter_lobby_state(void *m) { mp_enter_lobby_state(h2g(m)); }
-static void t_host_close_lobby(void *m) { mp_host_close_lobby(h2g(m)); }
-static void t_host_request_start(void *m) { mp_host_request_start(h2g(m)); }
-static void t_set_browsing(void *m, void *list) { mp_set_browsing(h2g(m), h2g(list)); }
-static int32_t t_get_host_count(void *m) { return mp_get_host_count(h2g(m)); }
-static void t_connect_to_host(void *m, int32_t i) { mp_connect_to_host(h2g(m), i); }
-static int32_t t_accept_peer(void *m) { return mp_accept_peer(h2g(m)); }
-static void t_decline_peer(void *m) { mp_decline_peer(h2g(m)); }
-static void t_cancel_connect(void *m) { mp_cancel_connect(h2g(m)); }
-static void t_resume_browsing(void *m) { mp_resume_browsing(h2g(m)); }
-static void t_host_start_countdown(void *m) { mp_host_start_countdown(h2g(m)); }
-static void t_begin_race_handshake(void *m) { mp_begin_race_handshake(h2g(m)); }
-static void t_on_host_selected(void *m, int32_t i) { mp_on_host_selected(h2g(m), i); }
+static void t_host_lobby_reenter(void *m) { flush_samples(); mp_host_lobby_reenter(h2g(m)); }
+static void t_enter_lobby_state(void *m) { flush_samples(); mp_enter_lobby_state(h2g(m)); }
+static void t_host_close_lobby(void *m) { flush_samples(); mp_host_close_lobby(h2g(m)); }
+static void t_host_request_start(void *m) { flush_samples(); mp_host_request_start(h2g(m)); }
+static void t_set_browsing(void *m, void *list) { flush_samples(); mp_set_browsing(h2g(m), h2g(list)); }
+static int32_t t_get_host_count(void *m) { flush_samples(); return mp_get_host_count(h2g(m)); }
+static void t_connect_to_host(void *m, int32_t i) { flush_samples(); mp_connect_to_host(h2g(m), i); }
+static int32_t t_accept_peer(void *m) { flush_samples(); return mp_accept_peer(h2g(m)); }
+static void t_decline_peer(void *m) { flush_samples(); mp_decline_peer(h2g(m)); }
+static void t_cancel_connect(void *m) { flush_samples(); mp_cancel_connect(h2g(m)); }
+static void t_resume_browsing(void *m) { flush_samples(); mp_resume_browsing(h2g(m)); }
+static void t_host_start_countdown(void *m) { flush_samples(); mp_host_start_countdown(h2g(m)); }
+static void t_begin_race_handshake(void *m) { flush_samples(); mp_begin_race_handshake(h2g(m)); }
+static void t_on_host_selected(void *m, int32_t i) { flush_samples(); mp_on_host_selected(h2g(m), i); }
 
-static int32_t t_get_player_count(void *m) { return mp_get_player_count(h2g(m)); }
+static int32_t t_get_player_count(void *m) { flush_samples(); return mp_get_player_count(h2g(m)); }
 static int32_t t_get_peer_lobby_state(void *m, int32_t i)
-{
+{ flush_samples();
     return mp_get_peer_lobby_state(h2g(m), i);
 }
-static int32_t t_has_connection_problem(void *m) { return mp_has_connection_problem(h2g(m)); }
-static int32_t t_has_pending_join_request(void *m) { return mp_has_pending_join_request(h2g(m)); }
-static int32_t t_has_rematch_sync_failed(void *m) { return mp_has_rematch_sync_failed(h2g(m)); }
-static int32_t t_is_peer_ready(void *m, int32_t i) { return mp_is_peer_ready(h2g(m), i); }
-static void t_kick_peer(void *m, int32_t i) { mp_kick_peer(h2g(m), i); }
-static void t_send_race_loaded(void *m) { mp_send_race_loaded(h2g(m)); }
-static void t_send_race_abort(void *m, int32_t reason) { mp_send_race_abort(h2g(m), reason); }
+static int32_t t_has_connection_problem(void *m) { flush_samples(); return mp_has_connection_problem(h2g(m)); }
+static int32_t t_has_pending_join_request(void *m) { flush_samples(); return mp_has_pending_join_request(h2g(m)); }
+static int32_t t_has_rematch_sync_failed(void *m) { flush_samples(); return mp_has_rematch_sync_failed(h2g(m)); }
+static int32_t t_is_peer_ready(void *m, int32_t i) { flush_samples(); return mp_is_peer_ready(h2g(m), i); }
+static void t_kick_peer(void *m, int32_t i) { flush_samples(); mp_kick_peer(h2g(m), i); }
+static void t_send_race_loaded(void *m) { flush_samples(); mp_send_race_loaded(h2g(m)); }
+static void t_send_race_abort(void *m, int32_t reason) { flush_samples(); mp_send_race_abort(h2g(m), reason); }
 /* MPM_Clear51c 0x4a0a8528 ist eine echte Funktion (12 Byte: mov r1,#0 ;
  * strb r1,[r0,#0x51c] ; bx lr), die der Kern komplett ersetzt — kein
  * sret-Stub, obwohl sie 12 Byte gross ist. */
-static void t_clear_51c(void *m) { mp_clear_51c(h2g(m)); }
+static void t_clear_51c(void *m) { flush_samples(); mp_clear_51c(h2g(m)); }
 
 /* Die beiden Aufrufstellen sind nur am Ruecksprungziel unterscheidbar. */
 static void t_send_local_race_end(void *m, int32_t position)
-{
+{ flush_samples();
     uint32_t lr = h2g(__builtin_return_address(0));
     int32_t from_leave = (lr == LR_RACE_END_LEAVE) ? 1 : 0;
     if (lr != LR_RACE_END_LEAVE && lr != LR_RACE_END_FINISH) {
@@ -466,22 +526,22 @@ static void t_send_local_race_end(void *m, int32_t position)
 
 /* sret-Stubs: der Kern liefert den Text, wir das Gastobjekt. */
 static void *t_host_name(void *sret, void *m, int32_t index)
-{
+{ flush_samples();
     *(void **)sret = make_guest_string(mp_host_name(h2g(m), index));
     return sret;
 }
 static void *t_requesting_peer_name(void *sret, void *m)
-{
+{ flush_samples();
     *(void **)sret = make_guest_string(mp_requesting_peer_name(h2g(m)));
     return sret;
 }
 static void *t_lobby_peer_name(void *sret, void *m, int32_t i)
-{
+{ flush_samples();
     *(void **)sret = make_guest_string(mp_lobby_peer_name(h2g(m), i));
     return sret;
 }
 static void *t_hud_peer_name(void *sret, void *m, int32_t i)
-{
+{ flush_samples();
     *(void **)sret = make_guest_string(mp_hud_peer_name(h2g(m), i));
     return sret;
 }
@@ -670,8 +730,181 @@ static void *hook_import(int export_index, void *impl)
  * Ladeschleifen).  Der Hook laeuft hinter dem Stack-Switch-Thunk, also auf dem
  * grossen Loader-Stack — genau richtig fuer Socket-I/O.
  * SOFTFP: s3eDeviceYield(uint32 ms) ist rein integer. */
+
+/* --------------------------------------------------------------------------
+ * Absturzbericht
+ *
+ * Auf der N9 gibt es kein gdb, und core_pattern steht auf /dev/null: ein
+ * SIGSEGV im Spiel hinterlaesst nur "killed by SIGSEGV" samt Fehleradresse --
+ * aber nicht, WO es passiert ist. Dieser Handler schreibt die Register, rechnet
+ * pc, lr und die Rueckkehradressen auf dem Stack in Gastadressen um (die
+ * Adressen der Reverse-Engineering-Berichte, Basis 0x4a000000) und laesst den
+ * Prozess danach sterben wie zuvor.
+ *
+ * Nur write(2) und eine eigene Hexausgabe; dladdr() ist nicht
+ * async-signal-sicher, wird aber erst gebraucht, wenn ohnehin alles verloren
+ * ist. SA_RESETHAND: faellt der Handler selbst (kaputtes sp), endet der
+ * Prozess mit dem Standardverhalten statt in einer Schleife.
+ */
+static void crash_put(const char *s)
+{
+    size_t n = strlen(s);
+    while (n) {
+        ssize_t w = write(2, s, n);
+        if (w <= 0)
+            return;
+        s += w;
+        n -= (size_t)w;
+    }
+}
+
+static void crash_hex(uint32_t v)
+{
+    char b[9];
+    int i;
+    for (i = 7; i >= 0; --i, v >>= 4)
+        b[i] = "0123456789abcdef"[v & 15];
+    b[8] = 0;
+    crash_put(b);
+}
+
+/* "gast 0x4a0dbf74" fuer Adressen im Spielabbild, sonst Bibliothek + Offset. */
+static void crash_where(uint32_t addr)
+{
+    Dl_info info;
+    uintptr_t base = (uintptr_t)g_code;
+    if (g_code && addr >= base && addr < base + g_memsz) {
+        crash_put(" (gast 0x");
+        crash_hex((uint32_t)(addr - base + 0x4a000000u));
+        crash_put(")");
+    } else if (dladdr((void *)(uintptr_t)addr, &info) && info.dli_fname) {
+        crash_put(" (");
+        crash_put(info.dli_fname);
+        crash_put("+0x");
+        crash_hex((uint32_t)(addr - (uintptr_t)info.dli_saddr));
+        if (info.dli_sname) {
+            crash_put(" ");
+            crash_put(info.dli_sname);
+        }
+        crash_put(")");
+    }
+}
+
+static void crash_handler(int sig, siginfo_t *si, void *ctx)
+{
+    static const char *const names[] = { "r0", "r1", "r2", "r3", "r4", "r5", "r6",
+                                         "r7", "r8", "r9", "r10", "fp", "ip" };
+    ucontext_t *uc = (ucontext_t *)ctx;
+    struct sigcontext *mc = &uc->uc_mcontext;
+    unsigned long reg[13];
+    uint32_t *sp;
+    int i;
+
+    reg[0] = mc->arm_r0;  reg[1] = mc->arm_r1;  reg[2] = mc->arm_r2;
+    reg[3] = mc->arm_r3;  reg[4] = mc->arm_r4;  reg[5] = mc->arm_r5;
+    reg[6] = mc->arm_r6;  reg[7] = mc->arm_r7;  reg[8] = mc->arm_r8;
+    reg[9] = mc->arm_r9;  reg[10] = mc->arm_r10; reg[11] = mc->arm_fp;
+    reg[12] = mc->arm_ip;
+
+    crash_put("\n[nfsmp] ===== ABSTURZ: Signal ");
+    crash_hex((uint32_t)sig);
+    crash_put(" in Thread ");
+    crash_hex((uint32_t)syscall(SYS_gettid));
+    crash_put(", Adresse 0x");
+    crash_hex((uint32_t)(uintptr_t)si->si_addr);
+    crash_put(" =====\n[nfsmp] pc=");
+    crash_hex((uint32_t)mc->arm_pc);
+    crash_where((uint32_t)mc->arm_pc);
+    crash_put("\n[nfsmp] lr=");
+    crash_hex((uint32_t)mc->arm_lr);
+    crash_where((uint32_t)mc->arm_lr);
+    crash_put("\n[nfsmp] sp=");
+    crash_hex((uint32_t)mc->arm_sp);
+    crash_put(" cpsr=");
+    crash_hex((uint32_t)mc->arm_cpsr);
+    for (i = 0; i < 13; ++i) {
+        crash_put(i % 4 == 0 ? "\n[nfsmp] " : " ");
+        crash_put(names[i]);
+        crash_put("=");
+        crash_hex((uint32_t)reg[i]);
+    }
+    /* Rueckkehradressen stehen irgendwo auf dem Stack; nur die Worte zeigen,
+     * die ins Spielabbild oder in eine Bibliothek zeigen. */
+    crash_put("\n[nfsmp] Stack (Worte, die in Code zeigen):");
+    sp = (uint32_t *)(uintptr_t)mc->arm_sp;
+    {
+        int shown = 0;
+        for (i = 0; i < 160 && shown < 40; ++i) {
+            uint32_t w = sp[i];
+            uintptr_t base = (uintptr_t)g_code;
+            Dl_info info;
+            int in_game = g_code && w >= base && w < base + g_memsz;
+            /* Rueckkehradressen in Bibliotheken (unsere eigene Aufrufkette):
+             * dladdr kennt das Objekt, und das Wort liegt hinter einem Symbol. */
+            int in_lib = !in_game && w > 0x10000 &&
+                         dladdr((void *)(uintptr_t)w, &info) && info.dli_fname;
+            if (in_game || in_lib) {
+                crash_put("\n[nfsmp]   sp+");
+                crash_hex((uint32_t)(i * 4));
+                crash_put(" ");
+                crash_hex(w);
+                crash_where(w);
+                ++shown;
+            }
+        }
+    }
+    crash_put("\n[nfsmp] Stack roh:");
+    for (i = 0; i < 48; ++i) {
+        crash_put(i % 6 == 0 ? "\n[nfsmp]   " : " ");
+        crash_hex(sp[i]);
+    }
+    crash_put("\n[nfsmp] Worte unter sp (sp-32..sp):");
+    for (i = -8; i < 0; ++i) {
+        crash_put(" ");
+        crash_hex(sp[i]);
+    }
+    crash_put("\n[nfsmp] ===== Ende Absturzbericht =====\n");
+    raise(sig); /* SA_RESETHAND: jetzt mit dem Standardverhalten */
+}
+
+static int is_our_handler(int sig)
+{
+    struct sigaction cur;
+    return sigaction(sig, NULL, &cur) == 0 && (cur.sa_flags & SA_SIGINFO) &&
+           cur.sa_sigaction == crash_handler;
+}
+
+static void install_crash_handler(void)
+{
+    static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT };
+    struct sigaction sa;
+    size_t i;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    for (i = 0; i < sizeof sigs / sizeof sigs[0]; ++i)
+        if (!is_our_handler(sigs[i]))
+            sigaction(sigs[i], &sa, NULL);
+}
+
 static void hook_yield(uint32_t ms)
 {
+    /* Das Spiel oder eine seiner Bibliotheken kann nach uns eigene Handler
+     * setzen; ab und zu nachsehen und unseren zuruecklegen. */
+    static unsigned n;
+    if ((++n & 0xff) == 1)
+        install_crash_handler();
+    if ((n & 0x7f) == 0) {
+        /* Nur melden, wenn Samples verloren gehen: dann ruft das Spiel im
+         * Rennen zu selten einen Stub, und die Gegner ruckeln. */
+        static unsigned last_drop;
+        if (g_sq_drop != last_drop) {
+            last_drop = g_sq_drop;
+            mp_logf("Samples: %u verworfen (Warteschlange voll), %u eingefuegt",
+                    g_sq_drop, g_sq_out);
+        }
+    }
     if (g_inited)
         mp_pump(current_mpm());
     if (g_real_yield)
@@ -910,6 +1143,7 @@ static void do_patch(void *imgv)
     if (g_pad > g_padend)
         g_pad = g_padend = g_padstart; /* kein Platz -> Veneers scheitern sauber */
 
+    g_memsz = memsz;
     mp_logf("Image: code=%p data=%p split=%08x memsz=%08x tramp=%p tsz=%u "
             "nexp=%u pad=%p..%p (%d B)",
             (void *)g_code, (void *)g_data, (unsigned)g_split, (unsigned)memsz,
@@ -1057,6 +1291,7 @@ __attribute__((constructor)) static void nfsmp_ctor(void)
         return;
     }
     reserve_guest_window();
+    install_crash_handler();
     mp_logf("geladen (Protokoll v%d, Ports %d/%d)", MP_PROTOCOL_VERSION,
             MP_DISCOVERY_PORT, MP_SESSION_PORT);
     if (getenv("NFSMP_FALLBACK")) {

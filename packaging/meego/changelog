@@ -1,0 +1,33 @@
+nfsshift-mp (0.1.1) unstable; urgency=medium
+
+  * Fix the crash when tapping the "ready" check mark in the lobby after
+    choosing a car. The game's screen element lookup (0x4a0a2fc4) compares
+    its index signed, so the -1 it is handed for elements the Wi-Fi lobby
+    layout does not have reached array[-1] on a screen without elements
+    (a read of 0xfffffffc). A one-word patch makes the compare unsigned; the
+    function already returns for -1 on that path.
+  * Fix the crash at the green light. Opponent samples were inserted into the
+    game's history vector straight from the s3eDeviceYield hook. When that
+    vector grew, the game's allocation went through the runtime's stack-switch
+    thunk and overwrote the hook's own live stack frames with the allocation
+    size (0xa4, 0x148). Samples are now queued and inserted when the game
+    itself calls one of the multiplayer stubs - the same call context in which
+    the game does its own allocations. A full race inserted all 2408 samples
+    without dropping one.
+  * Print a crash report on SIGSEGV, SIGBUS, SIGILL, SIGFPE and SIGABRT:
+    registers, pc and lr mapped to game addresses, and the call chain found on
+    the stack. The game still dies as before. Started from a shell,
+    NFSMP_LOG=/home/user/nfsmp.log /opt/nfsshift-mp/startup-mp.sh keeps it.
+  * Known issue: with the N9 as a guest (joining another device's session) the
+    game still crashes before the race has loaded. Hosting a race works, and
+    the Sailfish OS and Android ports join an N9 host without problems.
+
+ -- smatkovi <sebastian.matkovich@gmail.com>  Sun, 13 Sep 2026 19:20:00 +0200
+
+nfsshift-mp (0.1.0) unstable; urgency=low
+
+  * First release: LAN multiplayer transport for the MeeGo build of NFS Shift,
+    loaded with LD_PRELOAD next to the untouched original package. Up to four
+    players, cross-play with the Sailfish OS and Android ports.
+
+ -- smatkovi <sebastian.matkovich@gmail.com>  Sat, 12 Sep 2026 08:37:00 +0200
