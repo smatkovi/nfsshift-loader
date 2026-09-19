@@ -37,7 +37,7 @@
 %global debug_package %{nil}
 
 Name:       harbour-nfsshift
-Version:    0.1.3
+Version:    0.1.4
 Release:    1%{?relsuffix}
 Summary:    Need for Speed Shift (Marmalade-Build) auf Sailfish OS %{?datasummary}
 License:    GPL-3.0-or-later %{?datalicense}
@@ -65,9 +65,10 @@ Requires:       qt5-qtsensors-plugin-sensorfw
 Requires:       /usr/bin/python3
 
 %description
-Laedt den 32-Bit-ARM-Code des Marmalade-Builds von Need for Speed Shift in
-einen JIT (dynarmic) und setzt die Marmalade-Laufzeit auf SDL2 und OpenGL ES 2
-neu um.  Enthaelt den LAN-Mehrspielermodus (UDP 45470 Suche, UDP 45471 Spiel).
+Laedt den 32-Bit-ARM-Code des Marmalade-Builds von Need for Speed Shift und
+setzt die Marmalade-Laufzeit auf SDL2 und OpenGL ES 2 neu um.  Auf aarch64
+laeuft der Spielcode in einem JIT (dynarmic), auf armv7hl direkt auf der CPU.
+Enthaelt den LAN-Mehrspielermodus (UDP 45470 Suche, UDP 45471 Spiel).
 
 %if %{with gamedata}
 Dieses Paket bringt die Datendateien des Originalspiels mit (Urheberrecht

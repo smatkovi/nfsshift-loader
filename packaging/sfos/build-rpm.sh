@@ -20,8 +20,8 @@
 #
 # Umgebungsvariablen:
 #   BUILD_HOST     Vorgabe sebastian@192.168.1.21
-#   SDK_CONTAINER  Vorgabe sfossdk52
-#   SDK_TARGET     Vorgabe SailfishOS-5.2.0.15-aarch64
+#   SDK_CONTAINER  Vorgabe sfossdk52 (armv7hl: sfossdk52-0ad-arm, dessen Target liegt auf p7)
+#   SDK_TARGET     Vorgabe SailfishOS-5.2.0.15-aarch64 (oder ...-armv7hl: nativ, ohne dynarmic)
 #   JOBS           Vorgabe 16
 #
 # Alle Zwischenstaende liegen im Container unter /home/mersdk/rpmbuild-nfsshift
@@ -125,7 +125,9 @@ TOP=/home/mersdk/rpmbuild-nfsshift
 STAGE=$TOP/stage/$NAME-$VERSION
 SPEC=$SRC/packaging/sfos/$NAME.spec
 
-[ -d "$DYN" ] || { echo "dynarmic fehlt unter $DYN"; exit 1; }
+# armv7hl fuehrt den Spielcode nativ aus und braucht dynarmic nicht.
+case "$TARGET" in *armv7hl*) DYN= ;; esac
+[ -z "$DYN" ] || [ -d "$DYN" ] || { echo "dynarmic fehlt unter $DYN"; exit 1; }
 
 # --- Syntaxpruefung der .spec ---------------------------------------------
 echo "-- rpm -q --specfile"
@@ -146,8 +148,10 @@ rm -rf $TOP/BUILD $TOP/BUILDROOT $TOP/stage $TOP/SOURCES $TOP/RPMS
 mkdir -p $TOP/BUILD $TOP/BUILDROOT $TOP/RPMS $TOP/SOURCES $TOP/SPECS $TOP/SRPMS "$STAGE"
 
 cp -a $SRC/CMakeLists.txt $SRC/src $SRC/third_party $SRC/packaging "$STAGE/"
-cp -a $DYN "$STAGE/dynarmic"
-rm -rf "$STAGE/dynarmic/build" "$STAGE/dynarmic/.git"
+if [ -n "$DYN" ]; then
+    cp -a $DYN "$STAGE/dynarmic"
+    rm -rf "$STAGE/dynarmic/build" "$STAGE/dynarmic/.git"
+fi
 
 EXTRA=""
 if [ "$MODE" = prebuilt ]; then
@@ -166,7 +170,10 @@ tar -C $TOP/stage -czf "$TOP/SOURCES/$NAME-$VERSION.tar.gz" "$NAME-$VERSION"
 cp "$SPEC" "$TOP/SPECS/"
 echo "-- Quelltarball $(du -h "$TOP/SOURCES/$NAME-$VERSION.tar.gz" | cut -f1)"
 
-BUILD_TGT=$(sb2 -t "$TARGET" -- gcc -dumpmachine)
+# Nur die Architektur: mit dem vollen Tripel (armv7hl-meego-linux-gnueabi)
+# findet rpm seine Plattform-Makros nicht, %{_arch} bleibt dann unexpandiert
+# und die Dateiliste geht ins Leere.
+BUILD_TGT=${TARGET##*-}
 echo "-- rpmbuild --target=$BUILD_TGT $EXTRA (nice -n ${NICENESS:-15}, -j$JOBS)"
 set +e
 # Der Build-Rechner wird nebenher benutzt: der ganze Bau laeuft freundlich,
@@ -174,6 +181,7 @@ set +e
 nice -n ${NICENESS:-15} sb2 -t "$TARGET" -- rpmbuild \
     --define "_topdir $TOP" \
     --define "_smp_mflags -j$JOBS" \
+    --define "_smp_build_ncpus $JOBS" \
     --define "_rpmfilename %%{name}-%%{version}-%%{release}.%%{arch}.rpm" \
     --target="$BUILD_TGT" \
     $EXTRA -bb "$TOP/SPECS/$NAME.spec" > $TOP/rpmbuild.log 2>&1

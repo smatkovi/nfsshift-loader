@@ -1,8 +1,9 @@
 # NFS Shift Loader — Sailfish OS und Nokia N9
 
 Führt den 32-Bit-ARM-Code des Marmalade-Builds von *Need for Speed Shift*
-(MeeGo/Harmattan, `NFSShift.s3e`, 1.0.20) in einem JIT aus und setzt die
-Marmalade-Laufzeit auf SDL2 und OpenGL ES 2 neu um. Dazu der nachgerüstete
+(MeeGo/Harmattan, `NFSShift.s3e`, 1.0.20) aus — auf aarch64 in einem JIT, auf
+armv7hl direkt auf der CPU — und setzt die Marmalade-Laufzeit auf SDL2 und
+OpenGL ES 2 neu um. Dazu der nachgerüstete
 **LAN-Mehrspielermodus** für bis zu 4 Spieler, plattformübergreifend zwischen
 Sailfish OS, Android und der originalen N9.
 
@@ -21,7 +22,8 @@ Sailfish OS, Android und der originalen N9.
 
 | Ziel | Was läuft | Paket |
 |---|---|---|
-| **Sailfish OS** (aarch64) | unser eigener Loader | `harbour-nfsshift-*.aarch64.rpm` |
+| **Sailfish OS** (aarch64) | unser eigener Loader, Spielcode im JIT (dynarmic) | `harbour-nfsshift-*.aarch64.rpm` |
+| **Sailfish OS** (armv7hl) | unser eigener Loader, Spielcode nativ | `harbour-nfsshift-*.armv7hl.rpm` |
 | **Nokia N9** (armel) | der *originale* Loader plus `LD_PRELOAD` | `nfsshift-mp_*_armel.deb` |
 
 Auf der N9 läuft das Spiel ja bereits — dort fehlt nur der Mehrspielermodus.
@@ -95,7 +97,7 @@ der Mehrspielermodus bleibt aus.
 
 ```sh
 tools/build.sh                    # Sailfish aarch64, im SDK-Container
-packaging/sfos/build-rpm.sh       # RPM
+packaging/sfos/build-rpm.sh       # RPM (SDK_TARGET=SailfishOS-5.2.0.15-armv7hl: 32-bit, ohne dynarmic)
 meego/build.sh                    # libnfsmp.so mit der MADDE-Toolchain
 meego/test/run-test.sh            # qemu-Test der N9-Seite (45 Prüfungen)
 packaging/meego/build-deb.sh      # .deb
@@ -105,6 +107,27 @@ tools/x86-lan.sh                  # zwei Instanzen gegeneinander, headless
 
 Alle Skripte arbeiten über `ssh` auf einem Baurechner; `tools/buildhost.sh`
 sucht ihn (LAN-Adresse, sonst SSH-Alias), `BUILD_HOST` übersteuert.
+
+## armv7hl: nativ statt JIT
+
+dynarmic hat keinen Host-Backend für 32-Bit-ARM. Auf einem armv7hl-Gerät ist
+das aber auch nicht nötig: der Spielcode *ist* ARM-Code, die CPU führt ihn so
+aus, wie er ist (`src/cpu_native.cpp`, `src/cpu_native.S`, `GUEST_NATIVE`).
+Gastadressen sind dann Prozessadressen; `guest::init_address_space()` liest
+`/proc/self/maps`, merkt sich, was der Prozess schon belegt, und reserviert die
+freien Lücken des Gastfensters (PROT_NONE), damit später geladene Treiber
+nicht dorthin geraten, wo Heaps, Stacks und das Image (fest 0x4a000000)
+hingehören. Ein Import-Stub ist ein 16-Byte-Trampolin nach `hle_native_entry`,
+das r0–r3, sp und lr in einen Registerblock spillt; ab dort läuft derselbe
+Code wie im JIT-Build (`hle::dispatch`, `ArgCursor`). Die Aufrufkonvention
+passt, weil das Spiel soft-float ist und die HLE-Thunks Gleitkommawerte ohnehin
+als rohe Wörter aus den Integer-Registern lesen; in Gegenrichtung ruft
+`Cpu::call` über `native_call` mit rohen Wörtern.
+
+`tests/native_bridge_test.cpp` prüft die Brücke unter qemu-arm (Register- und
+Stapelargumente mit 8-Byte-Ausrichtung, float/double, 64-Bit-Rückgaben,
+verschachtelte Rückrufe ins Spiel). **Auf einem echten armv7hl-Gerät ist das
+Paket noch nicht gelaufen.**
 
 ## Stand
 

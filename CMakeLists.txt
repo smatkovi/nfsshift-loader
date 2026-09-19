@@ -10,13 +10,27 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-set(DYNARMIC_DIR "${CMAKE_SOURCE_DIR}/../dynarmic" CACHE PATH "dynarmic source tree")
-set(DYNARMIC_TESTS OFF CACHE BOOL "" FORCE)
-set(DYNARMIC_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
-set(DYNARMIC_USE_BUNDLED_EXTERNALS ON CACHE BOOL "" FORCE)
-set(DYNARMIC_FRONTENDS "A32" CACHE STRING "" FORCE)
-set(DYNARMIC_USE_PRECOMPILED_HEADERS OFF CACHE BOOL "" FORCE)
-add_subdirectory(${DYNARMIC_DIR} dynarmic EXCLUDE_FROM_ALL)
+# On a 32-bit ARM host the game's ARM code runs natively (src/cpu_native.*);
+# everywhere else it goes through the dynarmic A32 JIT (src/cpu.cpp).
+if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
+  set(GUEST_NATIVE_DEFAULT ON)
+else()
+  set(GUEST_NATIVE_DEFAULT OFF)
+endif()
+option(GUEST_NATIVE "run the game code natively instead of in the JIT (32-bit ARM hosts)" ${GUEST_NATIVE_DEFAULT})
+
+if(NOT GUEST_NATIVE)
+  set(DYNARMIC_DIR "${CMAKE_SOURCE_DIR}/../dynarmic" CACHE PATH "dynarmic source tree")
+  set(DYNARMIC_TESTS OFF CACHE BOOL "" FORCE)
+  set(DYNARMIC_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+  set(DYNARMIC_USE_BUNDLED_EXTERNALS ON CACHE BOOL "" FORCE)
+  set(DYNARMIC_FRONTENDS "A32" CACHE STRING "" FORCE)
+  set(DYNARMIC_USE_PRECOMPILED_HEADERS OFF CACHE BOOL "" FORCE)
+  add_subdirectory(${DYNARMIC_DIR} dynarmic EXCLUDE_FROM_ALL)
+else()
+  enable_language(ASM)
+  message(STATUS "32-bit ARM host: the game code runs natively, no JIT")
+endif()
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 REQUIRED sdl2)
@@ -32,7 +46,8 @@ target_compile_options(dlmalloc PRIVATE -w)
 add_executable(harbour-nfsshift
   src/main.cpp
   src/guest.cpp
-  src/cpu.cpp
+  src/cpu_common.cpp
+  src/hle_stubs.cpp
   src/s3e_image.cpp
   src/config.cpp
   src/hle_device.cpp
@@ -54,6 +69,13 @@ add_executable(harbour-nfsshift
 )
 set_source_files_properties(src/mp/nfsmp.c src/mp/glue.c src/mp/patches.c PROPERTIES COMPILE_OPTIONS "-std=c11")
 target_include_directories(harbour-nfsshift PRIVATE src third_party ${SDL2_INCLUDE_DIRS} ${GLES_INCLUDE_DIRS} ${LZMA_INCLUDE_DIRS} ${QT_INCLUDE_DIRS})
-target_link_libraries(harbour-nfsshift PRIVATE dynarmic dlmalloc ${SDL2_LIBRARIES} ${GLES_LIBRARIES} ZLIB::ZLIB ${LZMA_LIBRARIES} ${QT_LIBRARIES} pthread dl)
+if(GUEST_NATIVE)
+  target_sources(harbour-nfsshift PRIVATE src/cpu_native.cpp src/cpu_native.S)
+  target_compile_definitions(harbour-nfsshift PRIVATE GUEST_NATIVE=1)
+else()
+  target_sources(harbour-nfsshift PRIVATE src/cpu.cpp)
+  target_link_libraries(harbour-nfsshift PRIVATE dynarmic)
+endif()
+target_link_libraries(harbour-nfsshift PRIVATE dlmalloc ${SDL2_LIBRARIES} ${GLES_LIBRARIES} ZLIB::ZLIB ${LZMA_LIBRARIES} ${QT_LIBRARIES} pthread dl)
 target_compile_options(harbour-nfsshift PRIVATE -Wall -Wno-unused-parameter)
 target_link_options(harbour-nfsshift PRIVATE -pie)

@@ -1,12 +1,7 @@
+// JIT backend: dynarmic A32 on a 64-bit host.
 #include "cpu.h"
 
-#include <pthread.h>
-
 #include <cstring>
-#include <mutex>
-#include <string>
-#include <unordered_map>
-#include <vector>
 
 #include "dynarmic/interface/A32/a32.h"
 #include "dynarmic/interface/A32/config.h"
@@ -14,25 +9,6 @@
 
 using Dynarmic::HaltReason;
 
-namespace {
-// No thread_local here: on libhybris the Android GL driver writes bionic TLS
-// slots that overlap the executable's static TLS block.
-struct ThreadCpus {
-    pthread_t thread;
-    std::vector<Cpu *> stack;
-};
-std::mutex g_threads_mutex;
-std::vector<ThreadCpus *> g_threads;
-
-std::vector<Cpu *> &cpu_stack() {
-    pthread_t self = pthread_self();
-    std::lock_guard<std::mutex> lock(g_threads_mutex);
-    for (ThreadCpus *t : g_threads)
-        if (pthread_equal(t->thread, self)) return t->stack;
-    g_threads.push_back(new ThreadCpus{self, {}});
-    return g_threads.back()->stack;
-}
-}
 
 class Cpu::Callbacks final : public Dynarmic::A32::UserCallbacks {
 public:
@@ -138,7 +114,10 @@ Cpu::Cpu(const char *name) : name_(name), callbacks_(std::make_unique<Callbacks>
 
     Dynarmic::A32::UserConfig config;
     config.callbacks = callbacks_.get();
-    config.fastmem_pointer = 0;
+    // The JIT reads and writes guest memory directly at base + address; a
+    // fault (an unmapped page in the reservation) recompiles that access to go
+    // through the callbacks above. With the old identity mapping the base was 0.
+    config.fastmem_pointer = guest::g_base;
     config.recompile_on_fastmem_failure = true;
     config.enable_cycle_counting = false;
     config.code_cache_size = 128 * 1024 * 1024;
@@ -153,12 +132,6 @@ Cpu::~Cpu() = default;
 uint32_t &Cpu::reg(int i) { return jit_->Regs()[i]; }
 uint32_t Cpu::cpsr() const { return jit_->Cpsr(); }
 void Cpu::set_cpsr(uint32_t v) { jit_->SetCpsr(v); }
-
-Cpu &Cpu::current() {
-    std::vector<Cpu *> &stack = cpu_stack();
-    if (stack.empty()) fatal("no guest CPU on this thread");
-    return *stack.back();
-}
 
 uint32_t Cpu::call(addr_t fn, const uint32_t *args, size_t nargs) {
     if (!fn) fatal("[%s] call to null guest function", name_);
@@ -181,12 +154,11 @@ uint32_t Cpu::call(addr_t fn, const uint32_t *args, size_t nargs) {
     r[15] = fn & ~1u;
     jit_->SetCpsr((saved_cpsr & ~0x20u) | (fn & 1 ? 0x20u : 0u));
 
-    std::vector<Cpu *> &stack = cpu_stack();
-    stack.push_back(this);
+    cpu_thread::push(this);
     ++depth_;
     run_until_return();
     --depth_;
-    stack.pop_back();
+    cpu_thread::pop();
 
     uint32_t result = r[0];
     uint32_t result_hi = r[1];
@@ -214,98 +186,17 @@ void Cpu::run_until_return() {
 }
 
 // ---------------------------------------------------------------------------
-// HLE stub table
+// Stub encoding for the JIT: the stub raises an SVC with the import index,
+// dispatch() runs the host function, then `bx lr` returns to the game.
 
 namespace hle {
-namespace {
-std::unordered_map<std::string, HleFn> &registry() {
-    static std::unordered_map<std::string, HleFn> r;
-    return r;
-}
-std::vector<std::string> g_stub_names;
-std::vector<HleFn> g_stub_fns;
-std::vector<uint32_t> g_stub_calls;
-bool g_trace = false;
-bool g_stub_page_mapped = false;
-
-void unimplemented(Cpu &cpu) {}
-}  // namespace
-
-void register_fn(const char *name, HleFn fn) { registry()[name] = fn; }
-
-HleFn lookup(const char *name) {
-    auto it = registry().find(name);
-    return it == registry().end() ? nullptr : it->second;
-}
-
-void map_stub_page() {
-    if (g_stub_page_mapped) return;
-    if (!guest::map_fixed(STUB_BASE - 0x1000, 0x10000)) fatal("cannot map HLE stub page");
+void backend_init_stub_page() {
     guest::write32(RETURN_ADDR, 0xef000000 | RETURN_SVC);
     guest::write32(RETURN_ADDR + 4, 0xeafffffd);  // b RETURN_ADDR
-    g_stub_page_mapped = true;
 }
 
-addr_t stub_for(const char *name) {
-    map_stub_page();
-    for (size_t i = 0; i < g_stub_names.size(); ++i)
-        if (g_stub_names[i] == name) return STUB_BASE + 8 * i;
-    size_t idx = g_stub_names.size();
-    if (idx >= 0x1ff0) fatal("too many HLE stubs");
-    g_stub_names.emplace_back(name);
-    HleFn fn = lookup(name);
-    if (!fn) logf("[hle] no implementation for %s", name);
-    g_stub_fns.push_back(fn ? fn : unimplemented);
-    g_stub_calls.push_back(0);
-    addr_t at = STUB_BASE + 8 * idx;
-    guest::write32(at, 0xef000000 | static_cast<uint32_t>(idx));  // svc #idx
-    guest::write32(at + 4, 0xe12fff1e);                           // bx lr
-    return at;
-}
-
-void set_trace(bool on) { g_trace = on; }
-
-bool patch_arm_function(addr_t site, uint32_t expect, const char *name) {
-    uint32_t insn = guest::read32(site);
-    if (insn != expect) {
-        logf("[patch] %s at %#x: expected %08x, found %08x", name, site, expect, insn);
-        return false;
-    }
-    addr_t target = stub_for(name);
-    int64_t delta = (static_cast<int64_t>(target) - (static_cast<int64_t>(site) + 8)) >> 2;
-    if (delta < -(1 << 23) || delta >= (1 << 23)) {
-        logf("[patch] %s at %#x: stub out of branch range", name, site);
-        return false;
-    }
-    guest::write32(site, 0xea000000 | (static_cast<uint32_t>(delta) & 0xffffff));  // b stub
-    return true;
-}
-
-bool patch_bytes(addr_t site, const uint8_t *expect, const uint8_t *replacement, size_t size) {
-    if (memcmp(gptr(site), expect, size) != 0) {
-        logf("[patch] bytes at %#x do not match", site);
-        return false;
-    }
-    memcpy(gptr(site), replacement, size);
-    return true;
-}
-void (*post_call_hook)(Cpu &cpu, uint32_t svc) = nullptr;
-
-const char *name_of(uint32_t svc) { return svc < g_stub_names.size() ? g_stub_names[svc].c_str() : "?"; }
-
-void dispatch(Cpu &cpu, uint32_t svc) {
-    if (svc >= g_stub_fns.size()) fatal("[%s] unknown svc %#x at pc=%#x", cpu.name(), svc, cpu.reg(15));
-    uint32_t n = ++g_stub_calls[svc];
-    if (g_stub_fns[svc] == unimplemented) {
-        if (n <= 3) logf("[hle] unimplemented %s(%#x, %#x, %#x, %#x) lr=%#x", g_stub_names[svc].c_str(), cpu.reg(0),
-                         cpu.reg(1), cpu.reg(2), cpu.reg(3), cpu.reg(14));
-        cpu.reg(0) = 0;
-        return;
-    }
-    if (g_trace && n <= 20)
-        logf("[trace] %s(%#x, %#x, %#x, %#x) lr=%#x", g_stub_names[svc].c_str(), cpu.reg(0), cpu.reg(1), cpu.reg(2),
-             cpu.reg(3), cpu.reg(14));
-    g_stub_fns[svc](cpu);
-    if (post_call_hook) post_call_hook(cpu, svc);
+void write_stub(addr_t at, uint32_t idx) {
+    guest::write32(at, 0xef000000 | idx);  // svc #idx
+    guest::write32(at + 4, 0xe12fff1e);    // bx lr
 }
 }  // namespace hle

@@ -164,6 +164,7 @@ bool s3e_load(const std::string &path, S3eImage &out) {
         p += size;
     }
     out.imports = names;
+    guest::flush_code(h.base, h.mem_size);  // the native host executes this memory
     logf("[s3e] bound %zu imports", names.size());
     return true;
 }
