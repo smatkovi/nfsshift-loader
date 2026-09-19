@@ -126,8 +126,11 @@ als rohe Wörter aus den Integer-Registern lesen; in Gegenrichtung ruft
 
 `tests/native_bridge_test.cpp` prüft die Brücke unter qemu-arm (Register- und
 Stapelargumente mit 8-Byte-Ausrichtung, float/double, 64-Bit-Rückgaben,
-verschachtelte Rückrufe ins Spiel). **Auf einem echten armv7hl-Gerät ist das
-Paket noch nicht gelaufen.**
+verschachtelte Rückrufe ins Spiel). Das echte Spiel läuft unter qemu-arm mit
+`SDL_VIDEODRIVER=offscreen` und llvmpipe bis in den GL-Kontext (Speicherheaps,
+EGL-Konfiguration, Shader, rund 1500 HLE-Aufrufe) und beendet sich sauber über
+`s3eDeviceExit`. **Auf einem echten armv7hl-Gerät ist das Paket noch nicht
+gelaufen.**
 
 ## Stand
 
