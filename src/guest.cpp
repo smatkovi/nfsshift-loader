@@ -15,9 +15,6 @@
 
 #include "dlmalloc.h"
 
-#ifndef MAP_FIXED_NOREPLACE
-#define MAP_FIXED_NOREPLACE 0x100000
-#endif
 
 void fatal(const char *fmt, ...) {
     char msg[512];
@@ -66,71 +63,139 @@ mspace g_arena;
 std::unordered_map<std::string, addr_t> g_interned;
 }  // namespace
 
-void dump_low_mappings() {
-    FILE *f = fopen("/proc/self/maps", "r");
-    if (!f) return;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        unsigned long lo = strtoul(line, nullptr, 16);
-        if (lo < 0x100000000ul) fprintf(stderr, "  %s", line);
-    }
-    fclose(f);
-}
-
+uintptr_t g_base;
 namespace {
-constexpr uint64_t kLowLimit = 0x100000000ull;  // guest addresses are 32 bit
-// Every mapping below 4 GB as [begin, end), sorted.
-std::vector<std::pair<uint64_t, uint64_t>> low_mappings() {
-    std::vector<std::pair<uint64_t, uint64_t>> out;
-    FILE *f = fopen("/proc/self/maps", "r");
-    if (!f) return out;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        char *dash = nullptr;
-        uint64_t lo = strtoull(line, &dash, 16);
-        if (!dash || *dash != '-') continue;
-        uint64_t hi = strtoull(dash + 1, nullptr, 16);
-        if (hi <= lo || lo >= kLowLimit) continue;
-        out.push_back({lo, std::min(hi, kLowLimit)});
-    }
-    fclose(f);
-    std::sort(out.begin(), out.end());
-    return out;
-}
+bool g_ready;
+constexpr uint8_t OURS = 1;      // page mapped by map_fixed()
+constexpr uint8_t FOREIGN = 2;   // native host: page the process had before we started
+constexpr uint8_t RESERVED = 3;  // native host: PROT_NONE reservation of ours, free to map
+inline bool page_used(uint64_t pg) { return g_page_map[pg] != 0 && g_page_map[pg] != RESERVED; }
 }  // namespace
 
+#ifdef GUEST_NATIVE
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+// 32-bit ARM host: guest address == host address, the game code runs natively.
+// Mark what the process already occupies as foreign, then reserve the free
+// gaps of the guest window (PROT_NONE, address space only) so that drivers
+// loaded later and malloc arenas do not move in where the heaps, the stacks
+// and the game image (fixed at 0x4a000000) are going to be.
+void init_address_space() {
+    if (g_ready) return;
+    g_ready = true;
+    g_base = 0;
+    constexpr uint64_t kLimit = 0x100000000ull;
+    FILE *m = fopen("/proc/self/maps", "r");
+    if (!m) fatal("cannot read /proc/self/maps: %s", strerror(errno));
+    char line[512];
+    while (fgets(line, sizeof line, m)) {
+        unsigned long long s = 0, e = 0;
+        if (sscanf(line, "%llx-%llx", &s, &e) != 2) continue;
+        for (uint64_t a = s & ~static_cast<uint64_t>(PAGE - 1); a < e && a < kLimit; a += PAGE)
+            g_page_map[a >> 12] = FOREIGN;
+    }
+    fclose(m);
+
+    constexpr uint64_t kLow = 0x01000000, kHigh = 0x70000000;
+    uint64_t pg = kLow >> 12;
+    const uint64_t end = kHigh >> 12;
+    size_t reserved = 0;
+    while (pg < end) {
+        while (pg < end && g_page_map[pg]) ++pg;
+        uint64_t gap = pg;
+        while (pg < end && !g_page_map[pg]) ++pg;
+        if (pg == gap) continue;
+        void *want = reinterpret_cast<void *>(static_cast<uintptr_t>(gap << 12));
+        size_t size = static_cast<size_t>((pg - gap) << 12);
+        void *p = mmap(want, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p == MAP_FAILED || p != want) {
+            // An old kernel (or qemu-user) ignores NOREPLACE and hands out
+            // something else. The gap stays unreserved: map_fixed() then maps
+            // it with NOREPLACE page by page and checks what it got.
+            if (p != MAP_FAILED) munmap(p, size);
+            logf("[guest] could not reserve %#llx-%#llx: %s", (unsigned long long)(gap << 12),
+                 (unsigned long long)(pg << 12), p == MAP_FAILED ? strerror(errno) : "placed elsewhere");
+            continue;
+        }
+        for (uint64_t a = gap; a < pg; ++a) g_page_map[a] = RESERVED;
+        reserved += size;
+    }
+    logf("[guest] native host: guest addresses are host addresses, %zu MB reserved", reserved >> 20);
+}
+#else
+void init_address_space() {
+    if (g_ready) return;
+    g_ready = true;
+    // 4 GB for the guest and a guard behind them: a read of up to 8 bytes at
+    // 0xfffffffc must fault inside our own reservation, not in a neighbour's
+    // page. PROT_NONE with MAP_NORESERVE costs address space, not memory.
+    constexpr size_t kSpan = (static_cast<size_t>(1) << 32) + 0x10000;
+    void *p = mmap(nullptr, kSpan, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) fatal("cannot reserve 4 GB of address space for the guest: %s", strerror(errno));
+    g_base = reinterpret_cast<uintptr_t>(p);
+    logf("[guest] address space at %p", p);
+}
+
+#endif
+
+bool in_guest_space(const void *p) {
+#ifdef GUEST_NATIVE
+    return g_ready && p;
+#else
+    uintptr_t v = reinterpret_cast<uintptr_t>(p);
+    return g_base && v >= g_base && v - g_base < (static_cast<uint64_t>(1) << 32);
+#endif
+}
+
+void dump_low_mappings() {
+    // The guest window holds only our own mappings, so the page map is the whole
+    // truth; print it as merged ranges.
+    uint64_t start = 0;
+    bool in = false;
+    for (uint64_t pg = 0; pg <= g_page_map.size(); ++pg) {
+        bool m = pg < g_page_map.size() && g_page_map[pg];
+        if (m && !in) {
+            start = pg;
+            in = true;
+        } else if (!m && in) {
+            fprintf(stderr, "  %08llx-%08llx\n", (unsigned long long)(start << 12), (unsigned long long)(pg << 12));
+            in = false;
+        }
+    }
+}
+
 addr_t find_free_span(addr_t preferred, size_t want, size_t least, size_t *got) {
-    // The lowest 16 MB stay untouched: mmap_min_addr, the ELF of the process
-    // itself and its brk live down there, and nothing is gained by squeezing in.
+    // The lowest 16 MB stay untouched, as in the old identity-mapped layout; the
+    // guest never expected anything down there.
     constexpr uint64_t kFloor = 0x01000000ull;
+    constexpr uint64_t kLimit = 0x100000000ull;
     constexpr uint64_t kAlign = 0x100000ull;  // 1 MB, the step the heaps use
     *got = 0;
 
-    std::vector<std::pair<uint64_t, uint64_t>> gaps;
-    uint64_t at = kFloor;
-    for (const auto &m : low_mappings()) {
-        if (m.second <= at) continue;
-        if (m.first > at) gaps.push_back({at, m.first});
-        at = m.second;
+    auto range_free = [](uint64_t begin, uint64_t end) {
+        for (uint64_t a = begin & ~(PAGE - 1); a < end; a += PAGE)
+            if (page_used(a >> 12)) return false;
+        return true;
+    };
+    if (preferred >= kFloor && static_cast<uint64_t>(preferred) + want <= kLimit &&
+        range_free(preferred, static_cast<uint64_t>(preferred) + want)) {
+        *got = want;
+        return preferred;
     }
-    if (at < kLowLimit) gaps.push_back({at, kLowLimit});
 
-    // The wish first -- on Sailfish and the N9 it is simply free, and then the
-    // layout stays the one that has been tested there.
-    for (const auto &g : gaps)
-        if (preferred >= g.first && static_cast<uint64_t>(preferred) + want <= g.second) {
-            *got = want;
-            return preferred;
-        }
-
-    // Otherwise the smallest gap that holds all of `want` -- a 128 MB arena
-    // placed first must not eat the one big window the heaps need afterwards --
-    // and only when no gap is that big, the largest that still holds `least`.
+    // Gaps between our mappings, then smallest-that-fits / largest.
     uint64_t fit_base = 0, fit_size = ~0ull, best_base = 0, best_size = 0;
-    for (const auto &g : gaps) {
-        uint64_t b = (g.first + kAlign - 1) & ~(kAlign - 1);
-        if (b >= g.second) continue;
-        uint64_t size = g.second - b;
+    uint64_t pg = kFloor >> 12;
+    constexpr uint64_t kPages = kLimit >> 12;
+    while (pg < kPages) {
+        while (pg < kPages && page_used(pg)) ++pg;
+        uint64_t gap_begin = pg << 12;
+        while (pg < kPages && !page_used(pg)) ++pg;
+        uint64_t gap_end = pg << 12;
+        uint64_t b = (gap_begin + kAlign - 1) & ~(kAlign - 1);
+        if (b >= gap_end) continue;
+        uint64_t size = gap_end - b;
         if (size >= want && size < fit_size) {
             fit_size = size;
             fit_base = b;
@@ -150,29 +215,56 @@ addr_t find_free_span(addr_t preferred, size_t want, size_t least, size_t *got) 
 }
 
 bool map_fixed(addr_t start, size_t size) {
+    if (!g_ready) fatal("map_fixed before init_address_space");
+    if (!size) return true;
     const size_t hp = host_page();
-    uint64_t begin = start & ~(uint64_t)(hp - 1);
-    uint64_t end = (static_cast<uint64_t>(start) + size + hp - 1) & ~(uint64_t)(hp - 1);
-    void *p = mmap(gptr(static_cast<addr_t>(begin)), end - begin, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-    if ((p == MAP_FAILED && errno == EINVAL) || (p != MAP_FAILED && reinterpret_cast<uintptr_t>(p) != begin)) {
-        // MAP_FIXED_NOREPLACE needs Linux 4.17; older kernels ignore the flag
-        // and hand back some other address. Check the range ourselves instead.
-        if (p != MAP_FAILED) munmap(p, end - begin);
-        bool clear = true;
-        for (uint64_t a = begin; a < end && clear; a += hp)
-            if (msync(gptr(static_cast<addr_t>(a)), hp, MS_ASYNC) == 0) clear = false;
-        if (clear)
-            p = mmap(gptr(static_cast<addr_t>(begin)), end - begin, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    uint64_t end_req = static_cast<uint64_t>(start) + size;
+    if (end_req > (static_cast<uint64_t>(1) << 32)) return false;
+    // Refuse what is already ours: callers use the failure to find a free spot.
+    for (uint64_t a = start & ~static_cast<uint64_t>(PAGE - 1); a < end_req; a += PAGE)
+        if (page_used(a >> 12)) {
+            logf("[guest] %#llx-%#llx is already mapped, guest mappings:", (unsigned long long)start,
+                 (unsigned long long)end_req);
+            dump_low_mappings();
+            return false;
+        }
+    // mmap works in host pages, which are 16 KB on some Android devices. A host
+    // page that already carries another of our regions is RW already: skip it
+    // instead of mapping over (and zeroing) its contents.
+    uint64_t begin = start & ~static_cast<uint64_t>(hp - 1);
+    uint64_t end = (end_req + hp - 1) & ~static_cast<uint64_t>(hp - 1);
+    for (uint64_t h = begin; h < end; h += hp) {
+        bool used = false, reserved = false;
+        for (uint64_t a = h; a < h + hp && !used; a += PAGE) {
+            if (a >= (static_cast<uint64_t>(1) << 32)) break;
+            if (page_used(a >> 12)) used = true;
+            if (g_page_map[a >> 12] == RESERVED) reserved = true;
+        }
+        if (used) continue;
+        void *want = reinterpret_cast<void *>(g_base + h);
+#ifdef GUEST_NATIVE
+        // The game image, the stubs and the patches are code the CPU executes.
+        // Inside our own reservation MAP_FIXED is safe; elsewhere the page must
+        // not replace anything the process owns.
+        const int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+        const int fixed = reserved ? MAP_FIXED : MAP_FIXED_NOREPLACE;
+#else
+        (void)reserved;
+        const int prot = PROT_READ | PROT_WRITE;
+        const int fixed = MAP_FIXED;
+#endif
+        void *p = mmap(want, hp, prot, MAP_PRIVATE | MAP_ANONYMOUS | fixed, -1, 0);
+        if (p != MAP_FAILED && p != want) {
+            munmap(p, hp);  // NOREPLACE unsupported and the address was taken
+            errno = EEXIST;
+            p = MAP_FAILED;
+        }
+        if (p == MAP_FAILED) {
+            logf("[guest] mmap of guest page %#llx failed: %s", (unsigned long long)h, strerror(errno));
+            return false;
+        }
     }
-    if (p == MAP_FAILED || reinterpret_cast<uintptr_t>(p) != begin) {
-        if (p != MAP_FAILED) munmap(p, end - begin);
-        logf("[guest] mmap %#llx-%#llx failed, low mappings:", (unsigned long long)begin, (unsigned long long)end);
-        dump_low_mappings();
-        return false;
-    }
-    for (uint64_t a = begin; a < end; a += PAGE) g_page_map[a >> 12] = 1;
+    for (uint64_t a = begin; a < end && a < (static_cast<uint64_t>(1) << 32); a += PAGE) g_page_map[a >> 12] = OURS;
     return true;
 }
 

@@ -385,13 +385,36 @@ struct AttribState {
 };
 AttribState g_attribs[16];
 GLuint g_array_buffer;
+GLuint g_element_buffer;
 
 void track_glBindBuffer(GLenum target, GLuint b) {
     if (target == GL_ARRAY_BUFFER) g_array_buffer = b;
+    else if (target == GL_ELEMENT_ARRAY_BUFFER) g_element_buffer = b;
     glBindBuffer(target, b);
 }
 
-void track_glVertexAttribPointer(GLuint i, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void *ptr) {
+// Deleting a bound buffer unbinds it (GLES 2.0, section 2.9). The tracked
+// bindings have to follow, or a later client pointer would be taken for an
+// offset into a buffer that no longer exists.
+void track_glDeleteBuffers(GLsizei n, const GLuint *ids) {
+    for (GLsizei k = 0; ids && k < n; ++k) {
+        if (ids[k] && ids[k] == g_array_buffer) g_array_buffer = 0;
+        if (ids[k] && ids[k] == g_element_buffer) g_element_buffer = 0;
+    }
+    glDeleteBuffers(n, ids);
+}
+
+// With a buffer bound, the "pointer" of glVertexAttribPointer and the indices of
+// glDrawElements are offsets into that buffer and must reach GL unchanged; only
+// without one are they client pointers into guest memory. The generic argument
+// conversion cannot know which, so both take the raw guest word.
+static const void *gl_pointer_or_offset(addr_t word, GLuint bound) {
+    if (bound) return reinterpret_cast<const void *>(static_cast<uintptr_t>(word));
+    return word ? gptr(word) : nullptr;
+}
+
+
+void vertex_attrib_pointer(GLuint i, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void *ptr) {
     if (i < 16) {
         AttribState &a = g_attribs[i];
         a.set = true;
@@ -403,6 +426,10 @@ void track_glVertexAttribPointer(GLuint i, GLint size, GLenum type, GLboolean no
         a.buffer = g_array_buffer;
     }
     glVertexAttribPointer(i, size, type, norm, stride, ptr);
+}
+
+void track_glVertexAttribPointer(GLuint i, GLint size, GLenum type, GLboolean norm, GLsizei stride, addr_t word) {
+    vertex_attrib_pointer(i, size, type, norm, stride, gl_pointer_or_offset(word, g_array_buffer));
 }
 
 void track_glEnableVertexAttribArray(GLuint i) {
@@ -426,9 +453,13 @@ void relatch_attribs() {
     }
 }
 
-void track_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
+void draw_elements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
     relatch_attribs();
     glDrawElements(mode, count, type, indices);
+}
+
+void track_glDrawElements(GLenum mode, GLsizei count, GLenum type, addr_t word) {
+    draw_elements(mode, count, type, gl_pointer_or_offset(word, g_element_buffer));
 }
 
 void track_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
@@ -482,13 +513,15 @@ struct AttribDbg {
 };
 AttribDbg g_attr[8];
 
-void hle_glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void *ptr) {
-    if (seq_logging()) logf("[seq] glVertexAttribPointer(%u, %d, %#x, stride %d, off %lu) with ARRAY=%u", index, size, type, stride, (unsigned long)reinterpret_cast<uintptr_t>(ptr), g_bound_array);
+void hle_glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean norm, GLsizei stride, addr_t word) {
+    const void *ptr = gl_pointer_or_offset(word, g_array_buffer);
+    if (seq_logging()) logf("[seq] glVertexAttribPointer(%u, %d, %#x, stride %d, off %lu) with ARRAY=%u", index, size, type, stride, (unsigned long)word, g_bound_array);
     if (index < 8) g_attr[index] = {size, type, stride, reinterpret_cast<uintptr_t>(ptr), g_bound_array};
-    track_glVertexAttribPointer(index, size, type, norm, stride, ptr);
+    vertex_attrib_pointer(index, size, type, norm, stride, ptr);
 }
 
-void hle_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
+void hle_glDrawElements(GLenum mode, GLsizei count, GLenum type, addr_t word) {
+    const void *indices = gl_pointer_or_offset(word, g_element_buffer);
     if (seq_logging()) logf("[seq] glDrawElements(count %d) ELEMENT=%u", count, g_bound_element);
     static int logged = 0;
     if (logged < 3000 && g_bound_element) {
@@ -525,13 +558,14 @@ void hle_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *ind
              vbo_size, (unsigned long)p.ptr, p.stride, verts, (verts >= 0 && maxi >= (unsigned long)verts) ? "  <-- OUT OF RANGE" : "");
         ++logged;
     }
-    track_glDrawElements(mode, count, type, indices);
+    draw_elements(mode, count, type, indices);
 }
 
 struct Register {
     Register() {
         register_gl_thunks();
         hle::reg("glBindBuffer", HLE_WRAP(track_glBindBuffer));
+        hle::reg("glDeleteBuffers", HLE_WRAP(track_glDeleteBuffers));
         hle::reg("glVertexAttribPointer", HLE_WRAP(track_glVertexAttribPointer));
         hle::reg("glEnableVertexAttribArray", HLE_WRAP(track_glEnableVertexAttribArray));
         hle::reg("glDisableVertexAttribArray", HLE_WRAP(track_glDisableVertexAttribArray));

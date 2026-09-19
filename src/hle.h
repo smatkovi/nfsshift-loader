@@ -43,7 +43,12 @@ struct ArgCursor {
 };
 
 template <class T> T get_arg(ArgCursor &c) {
-    if constexpr (std::is_pointer_v<T>) return reinterpret_cast<T>(static_cast<uintptr_t>(c.word()));
+    // Guest pointers become host pointers into the guest window -- except 0,
+    // which has to stay nullptr: GL and s3e functions test for NULL.
+    if constexpr (std::is_pointer_v<T>) {
+        uint32_t w = c.word();
+        return w ? reinterpret_cast<T>(gptr(w)) : nullptr;
+    }
     else if constexpr (std::is_same_v<T, float>) return std::bit_cast<float>(c.word());
     else if constexpr (std::is_same_v<T, double>) return std::bit_cast<double>(c.dword());
     // Only long long is a 64-bit guest argument; host `long` (GLsizeiptr,

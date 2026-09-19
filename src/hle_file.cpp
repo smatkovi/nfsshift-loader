@@ -239,7 +239,7 @@ int64_t raw_read(File &f, void *buf, uint32_t n) {
     }
     case Kind::User: {
         // The callback needs a guest buffer; host buffers are bounced.
-        if (reinterpret_cast<uintptr_t>(buf) >> 32) {
+        if (!guest::in_guest_space(buf)) {
             addr_t bounce = guest::alloc(n);
             int32_t r = static_cast<int32_t>(ucall(f.userfs, U_READ, {bounce, 1, n, f.user_handle}));
             if (r > 0) memcpy(buf, gptr(bounce), r);

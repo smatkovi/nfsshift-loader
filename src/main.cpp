@@ -11,6 +11,7 @@
 #include "config.h"
 #include "cpu.h"
 #include "display.h"
+#include "guest.h"
 #include "mp_host.h"
 #include "runtime.h"
 #include "s3e_image.h"
@@ -41,6 +42,9 @@ static std::string find_data_dir(const std::string &home) {
 }
 
 int main(int argc, char **argv) {
+    // First of all: the guest's 4 GB, before anything maps guest memory.
+    guest::init_address_space();
+
     // Sailfish hangs its volume keys and its silent profile off the PulseAudio
     // media role: everything the user controls lives under the role "x-maemo",
     // and a stream with any other role simply is not covered by that policy and
